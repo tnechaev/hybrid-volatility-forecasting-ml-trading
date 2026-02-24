@@ -107,7 +107,7 @@ All features are constructed to avoid forward-looking bias.
 
 ---
 
-## Results (In-Sample Rolling Backtest)
+## Results (Rolling Backtest)
 
 | Metric | Value |
 |--------|-------|
@@ -116,8 +116,6 @@ All features are constructed to avoid forward-looking bias.
 | FR IC (ML residual) | 0.18 |
 | DE IC (GARCH baseline) | 0.08 |
 | FR IC (GARCH baseline) | 0.07 |
-| Strategy Sharpe (with costs) | 0.8 |
-| Max Drawdown | -13.8% |
 
 Interpretation:
 - ML improves upon a weak GARCH baseline

@@ -116,6 +116,8 @@ All features are constructed to avoid forward-looking bias.
 | FR IC (ML residual) | 0.18 |
 | DE IC (GARCH baseline) | 0.08 |
 | FR IC (GARCH baseline) | 0.07 |
+| DE Rank autocorr. | 0.78 |
+| FR Rank autocorr. | 0.68 |
 
 Interpretation:
 - ML improves upon a weak GARCH baseline

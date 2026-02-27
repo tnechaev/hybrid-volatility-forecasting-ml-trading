@@ -1,5 +1,10 @@
 # GARCH-Filtered Volatility Forecasting with Machine Learning (XGBoost)
 
+## IMPORTANT UPDATE!
+
+**26.02.2026** -- I found a significant structural issue in my data reconstruction. Not only the dataset is small, but, due to this structural issue, the modeling technique used does not correspond properly to the data. All results here to be taken very cautiously. I am working on proper historical (ENTSO-e, Copernicus, EMBER) data analysis that spans several years. The main model idea (GARCH + XGBoost) will stay the same, with more complexity required for work with long-history data spanning several regimes. The cross-country trading strategy will stay the same, with two separate signal series for FR and DE available for use. This repo will be likely deleted or wiped clean and updated with the new project, with all the functions of data retrieval and extended modeling/validation steps for full reproduction. I plan to post the updated project within 2-4 days since this announcement. 
+
+
 ## Overview
 
 This project implements a **hybrid volatility forecasting framework** for 24-hour electricity futures in the **Germany–France (DE–FR) coupled power market**.

@@ -18,12 +18,13 @@ The objective is **relative ranking of volatility (cross-sectional signal extrac
 ## IMPORTANT UPDATE!
 
 **01.03.2026** -- This a **major update** of the previous work. Most significant changes:
-- Proper **historical data**, fetched from ENTSO-e (generation, load), Copernicus (weather) and EMBER (prices), previously -- pre-aggregated small data sample from a ML competition. Data span currently from **01.2017 to 12.2023** and will be extended to 01.2015 till these days.  
+- Proper **historical data** (previously -- pre-aggregated small data sample from a ML competition), spanning currently from **01.2017 to 12.2023**. Soon the extended period from 01.2015 till now will be included.  
 - GARCH(1,1) was previously used as a baseline model, however, it did not yield satisfactory results on the new dataset. Replaced with **HAR-RV** for further use; previous results kept for demostration and comparison.
 - All the modeling execution is now parallelized.
 ---
 
 ## Data
+
 - **ENTSO-e**: hourly generation and load data
 - **Copernicus**: hourly  weather data (rain, wind, temperature)
 - **EMBER**: electricity hourly price data (found it easier to retrieve than directly from ENTSO-e)
@@ -130,7 +131,7 @@ All features are constructed to avoid forward-looking bias.
 
 ---
 
-### Trading Results (With Costs)
+### Trading Results (OOS, incl. costs)
 
 | Metric               | Value |
 |----------------------|-------|
@@ -144,6 +145,6 @@ All features are constructed to avoid forward-looking bias.
 - Baseline currently not regime-aware, could still be improved overall
 - Substantial overfitting (train/val gap of ~0.2) --> improve feature engineering and hyperparameter optimizaton (can be e.g. Bayesian)
 -  Regime detection may be utilized sub-optimally, separate per-regime model implementation can be considered
-- Trading strategy: still sensitive to extremes, more realistic execution modeling can be done
+- Trading strategy: still sensitive to extremes, more realistic execution modeling can be done. Cost estimate is very optimistic, need more research of what real values are
 ---
 

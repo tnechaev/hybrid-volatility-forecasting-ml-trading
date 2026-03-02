@@ -29,7 +29,9 @@ The objective is **relative ranking of volatility (cross-sectional signal extrac
 - **Copernicus**: daily  weather data (rain, wind, temperature)
 - **EMBER**: hourly electricity price data (found it easier to retrieve than directly from ENTSO-e)
 
-All data is then re-aggregated into daily. Realized volatility and log prices are buit from price data. Physical units are kept for the variables. For more details and instructions for data retrieval and processing please check data_processing.ipynb
+All data is then re-aggregated into daily. Realized volatility and log prices are buit from price data. Physical units are kept for the variables. For more details and instructions for data retrieval and processing please check data_processing.ipynb.
+
+
 ---
 
 ## Objective & Evaluation

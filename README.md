@@ -144,8 +144,7 @@ All features are constructed to avoid forward-looking bias.
 | Max Drawdown         |-5.91 |
 | Avg Daily Turnover   | 0.84 |
 | Win Rate | 45.85% |
-| Daily PnL after cost | 107.68 |
-| Total Cost | 15.73 (50 bps) |
+| Cost coverage ratio | 7.85 |
 ---
 
 # Current issues and next steps:

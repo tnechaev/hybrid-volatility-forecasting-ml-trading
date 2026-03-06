@@ -13,18 +13,19 @@ The approach combines:
 
 The objective is **relative ranking of volatility (cross-sectional signal extraction)** , not precise level prediction.
 
-> Research-grade project, work in progress! Right now all the functions and methods and analysis are in one notebook, which will be changed soon. Results are non-optimal at this stage either, and active investigation is ongoing.
+> Research-grade project, work in progress! 
 
 ## WHAT'S NEW
 
 - **03.03.2026** 
-- Tested **rolling-window** vs expanding window CV, now a new function incorporating both functionalities is in place. Motivation -- potentially better performance of rolling windows on multi-regime data, where regimes are persistent. Markov regime detection currently does not work as intended, therefore analyzing without it for now. **Result**: improved IC by 0.3 points (pooled and per-country) compared to exp. window.
-- Optuna optimizer for XGBoost hyperparameters, simple version trained/tested on post-2022 regime, not on full data and not in the main CV. Per-country optimization. Result: minor/no improvement in metrics, but substantial improvement of overfitting gap (FR, DE 0.16, 0.11 vs 0.21, 0.16). However, optimization ideally needs to run in the main CV function.
+- Tested **rolling-window** XGBoost (expanding window functionality kept). Motivation: when regimes change persistently, better not to overuse old data. **Result**: improved IC by 0.3 points (pooled and per-country) compared to exp. window.
+- Optuna for XGBoost hyperparameter optimization, trained/tested on post-2022 regime. Result: minor/no improvement in metrics, but substantial improvement of overfitting gap (FR, DE 0.16, 0.11 vs 0.21, 0.16). However, optimization ideally needs to run in the main CV function.
 
 **01.03.2026** -- This a **major update** of the previous work. Most significant changes:
-- Proper **historical data** (previously -- pre-aggregated small data sample from a ML competition), spanning from **01.2015 to 02.2026**.  
-- GARCH(1,1) was previously used as a baseline model, however, it did not yield satisfactory results on the new dataset. Replaced with **HAR-RV** for further use; previous results kept for demostration and comparison.
-- All the modeling execution is now parallelized.
+- **Historical data** from **01.2015 to 02.2026** (previously -- pre-aggregated small data sample from a ML competition).  
+- GARCH(1,1), previously used as a baseline, did not perform on the new dataset --> replaced with **HAR-RV**. GARCH results kept for demostration and comparison.
+- Most of the code runs in parallel.
+
 ---
 
 ## Data
@@ -80,6 +81,8 @@ Why XGBoost:
 - Captures nonlinear regime effects
 - Handles threshold behavior typical in power markets
 - Flexible in terms of regularization
+
+
 ---
 
 ### 3. Feature Engineering
@@ -149,9 +152,13 @@ All features are constructed to avoid forward-looking bias.
 
 # Current issues and next steps:
 
-- Mostly raw and a few basic engineered features are used for XGBoost right now -- add and test more engineered features
--  Regime detection inside the CV function currently mixes up regimes -- need more robust implementation
-- Trading strategy: still sensitive to extremes, more realistic execution modeling (slippage, realistic fees) can be done
-- Improve diagnostic plots to make them more informative, esp. noisy per-fold ones
+- Add and test more engineered features (very few basic are in use now, raw features dominate)
+- Add generation forecasts/outages / their errors as features
+- Nuclear generation in France is one of the most important features, and needs to be worked on and detected by XGBoost as such
+-  Fix regime detection inside CV loop 
+- Need more realistic execution modeling (slippage, realistic fees) for trading strategy
+- Improve diagnostic plots (think of more informative per-fold ones, if possible)
+
+
 ---
 

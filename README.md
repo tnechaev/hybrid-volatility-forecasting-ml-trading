@@ -2,13 +2,13 @@
 
 ## Overview
 
-This project implements a **hybrid volatility forecasting framework**  (day-ahead) in Germany and France power markets. Please see mainfile_plus_demo.ipynb for functions and full demonstration with graphics and diagnostics output.
+This project implements a **hybrid volatility forecasting framework**  (day-ahead) in Germany and France power markets. Please see **demo.ipynb** for the full demonstration with graphics and diagnostics output.
 
 The approach combines:
 
 1. **Rolling  HAR-RV** to model systematic volatility dynamics  
 2. **XGBoost in rolling or expanding windows** to forecast residual volatility  
-3. **Hidden Markov Model** -based regime detection
+3. **Hidden Markov Model**- or vol z-score-based regime detection
 4. **Rank-based primary metrics, validation and trading implementation**
 
 The objective is **relative ranking of volatility (cross-sectional signal extraction)** , not precise level prediction.
@@ -23,8 +23,8 @@ The objective is **relative ranking of volatility (cross-sectional signal extrac
 
 **01.03.2026** -- This a **major update** of the previous work. Most significant changes:
 - **Historical data** from **01.2015 to 02.2026** (previously -- pre-aggregated small data sample from a ML competition).  
-- GARCH(1,1), previously used as a baseline, did not perform on the new dataset --> replaced with **HAR-RV**. GARCH results kept for demostration and comparison.
-- Most of the code runs in parallel.
+- GARCH(1,1), previously used as a baseline, did not perform on the new dataset --> replaced with **HAR-RV**.
+- Most of the code is parallelized.
 
 ---
 
@@ -152,11 +152,10 @@ All features are constructed to avoid forward-looking bias.
 
 # Current issues and next steps:
 
-- Add and test more engineered features (very few basic are in use now, raw features dominate)
+- Fix feature selector to rolling windows, regime separation -- right now it does not work properly for France
+- Add and test more engineered features (very few basic are in use now)
 - Add generation forecasts/outages / their errors as features
-- Nuclear generation in France is one of the most important features, and needs to be worked on and detected by XGBoost as such
--  Fix regime detection inside CV loop 
-- Need more realistic execution modeling (slippage, realistic fees) for trading strategy
+- More realistic execution modeling (slippage, realistic fees) for trading strategy
 - Improve diagnostic plots (think of more informative per-fold ones, if possible)
 
 

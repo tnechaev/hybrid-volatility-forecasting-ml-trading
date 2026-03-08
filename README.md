@@ -87,7 +87,7 @@ Why XGBoost:
 
 ### 3. Feature Engineering
 
-Features are designed to reflect structural system regimes. Currently very minimalist, but can expand the feature pool later.
+Features are designed to reflect structural system regimes. Currently very minimalist, to be expanded.
 
 **Volatility persistence**
 - Lagged log prices
@@ -110,14 +110,15 @@ All features are constructed to avoid forward-looking bias.
 - **Hidden Markov Model (HMM)**-based regime classifier
 - Unsupervised n-state (n=2) Gaussian HMM
 - Probabilistic regime assignment --> detecting high/low vol states
+- Or alternatively **vol z-score**-based regime classification
 
-## Results (Baseline + ML in expanding window walk-forward CV)
+## Results (Baseline + ML in rolling window walk-forward CV)
 
 | Metric | Value |
 |--------|-------|
-| Pooled IC (ML) | 0.39 |
-| DE IC (ML) | 0.41 |
-| FR IC (ML) | 0.34 |
+| Pooled IC (ML) | 0.41 |
+| DE IC (ML) | 0.42 |
+| FR IC (ML) | 0.37 |
 | DE IC (baseline) | 0.60 |
 | FR IC (baseline) | 0.56 |
 
@@ -129,7 +130,7 @@ All features are constructed to avoid forward-looking bias.
 
 ## Trading Framework
 
-- Cross-country market-neutral framework
+- Cross-country 'market-neutral'-style framework
 - OOS backtest
 - Rolling z-scores, no lookahead
 - Adaptive thresholding (static/quantile/vol-based)
@@ -143,11 +144,11 @@ All features are constructed to avoid forward-looking bias.
 
 | Metric               | Value |
 |----------------------|-------|
-| Sharpe Ratio         | 1.69  |
-| Max Drawdown         |-5.91 |
-| Avg Daily Turnover   | 0.84 |
-| Win Rate | 45.85% |
-| Cost coverage ratio | 7.85 |
+| Sharpe Ratio         | 1.78  |
+| Max Drawdown         |-6.34 |
+| Avg Daily Turnover   | 0.82 |
+| Win Rate | 45.67% |
+| Cost coverage ratio | 8.34 |
 ---
 
 # Current issues and next steps:

@@ -109,16 +109,20 @@ def baseline_check(df, pref, window=126, acf_lags=40, plot=True):
     if plot:
 
         # Rolling metrics
-        fig, ax = plt.subplots(2,1,figsize=(12,7),sharex=True)
+        #fig, ax = plt.subplots(2,1,figsize=(12,7),sharex=True)
+        plt.figure(figsize=(12,4))
+        plt.plot(roll_df.index, roll_df["roll_spearman"], label="Rolling Spearman")
+        plt.axhline(0,color="k",lw=0.5)
+        plt.title(f"{pref} Rolling Spearman (window={window})")
+        #plt.grid()
+        #ax[0].plot(roll_df.index, roll_df["roll_spearman"], label="Rolling Spearman")
+        #ax[0].axhline(0,color="k",lw=0.5)
+        #ax[0].set_title(f"{pref} Rolling Spearman (window={window})")
+        #ax[0].grid()
 
-        ax[0].plot(roll_df.index, roll_df["roll_spearman"], label="Rolling Spearman")
-        ax[0].axhline(0,color="k",lw=0.5)
-        ax[0].set_title(f"{pref} Rolling Spearman (window={window})")
-        ax[0].grid()
-
-        ax[1].plot(roll_df.index, roll_df["roll_rmse"], label="Rolling RMSE")
-        ax[1].set_title("Rolling RMSE")
-        ax[1].grid()
+        #ax[1].plot(roll_df.index, roll_df["roll_rmse"], label="Rolling RMSE")
+        #ax[1].set_title("Rolling RMSE")
+        #ax[1].grid()
 
         plt.tight_layout()
         plt.show()
@@ -290,8 +294,8 @@ def plot_cv_diagnostics(preds: pd.DataFrame, metrics: Dict[str, Any], max_acf_la
                 plt.tight_layout()
                 plt.show()
 
-    plot_rolling_metric(rolling_rmse, "Rolling RMSE (per-country)", "RMSE")
-    plot_rolling_metric(rolling_mae, "Rolling MAE (per-country)", "MAE")
+    #plot_rolling_metric(rolling_rmse, "Rolling RMSE (per-country)", "RMSE")
+    #plot_rolling_metric(rolling_mae, "Rolling MAE (per-country)", "MAE")
 
 
     from scipy.stats import linregress
@@ -505,6 +509,7 @@ def plot_cv_diagnostics(preds: pd.DataFrame, metrics: Dict[str, Any], max_acf_la
         has_de_rmse = (train_rmse_de is not None and val_rmse_de is not None)
         has_fr_rmse = (train_rmse_fr is not None and val_rmse_fr is not None)
 
+        """
         if has_de_rmse or has_fr_rmse:
             plt.figure(figsize=(14, 4))
             if has_fr_rmse:
@@ -517,6 +522,7 @@ def plot_cv_diagnostics(preds: pd.DataFrame, metrics: Dict[str, Any], max_acf_la
             plt.title("Val - Train RMSE difference (per-country)")
             plt.xlabel("train_until"); plt.ylabel("Val - Train RMSE")
             plt.legend(); plt.grid(True); plt.xticks(rotation=30); plt.tight_layout(); plt.show()
+            """
 
         # Print two summary numbers (if present) as in original code
         try:

@@ -64,7 +64,7 @@ def build_features(panel: pd.DataFrame, eps: float = 1e-8) -> pd.DataFrame:
             #df[f"{col}_lag1"] = df[col].shift(1)
             df[f"{col}_lag7"] = df[col].shift(6)
 
-    # Rolling means/std 
+    # Rolling means/std (shift first!)
     for pref in prefixes:
         for base in ['load_MW', 'wind_total', 'solar_total']:
             col = f"{pref}_{base}"
@@ -76,22 +76,75 @@ def build_features(panel: pd.DataFrame, eps: float = 1e-8) -> pd.DataFrame:
             df[f"{col}_rm_7"] = df[col].rolling(7, min_periods=2).mean()
             df[f"{col}_std_7"] = df[col].rolling(7, min_periods=2).std()
             df[f"{col}_rm_30"] = df[col].rolling(30, min_periods=5).mean()
+            
 
 
     # Volatility features
     for pref in prefixes:
         rcol = f"{pref}_daily_log_return"
+        rv_col  = f"{pref}_realized_vol"
         if rcol not in df.columns:
             continue
         #df[f"{rcol}_vol_14"] = df[rcol].shift(1).rolling(14, min_periods=5).std()
         df[f"{rcol}_vol_14"] = df[rcol].rolling(14, min_periods=5).std()
 
-    # Cross-country features 
+        # HAR-RV components (expose for XGBoost to weight independently)
+        df[f"{pref}_rv_weekly"]  = df[rv_col].rolling(5,  min_periods=3).mean()
+        df[f"{pref}_rv_monthly"] = df[rv_col].rolling(22, min_periods=10).mean()
+        df[f"{pref}_rv_ratio"]   = (df[f"{pref}_rv_weekly"] /
+                                    (df[f"{pref}_rv_monthly"] + 1e-8))
+
+        # Vol regime indicator — no HMM needed
+        if rcol in df.columns:
+            vol_14  = df[rcol].rolling(14,  min_periods=7).std()
+            vol_252 = df[rcol].rolling(252, min_periods=60).std()
+            df[f"{pref}_vol_ratio"] = vol_14 / (vol_252 + 1e-8)
+
+    # Cross-country vol features 
+    if "DE_realized_vol" in df.columns and "FR_realized_vol" in df.columns:
+        df["VOL_SPREAD"] = df["DE_realized_vol"] - df["FR_realized_vol"]
+        df["VOL_RATIO"]  = df["DE_realized_vol"] / (df["FR_realized_vol"] + 1e-8)
+
+    # French nuclear availability deviation
+    if ("FR_Nuclear_Actual_Aggregated" in df.columns and
+            "FR_total_generation" in df.columns):
+        df["FR_nuclear_share"] = (df["FR_Nuclear_Actual_Aggregated"] /
+                                  (df["FR_total_generation"] + 1e-8))
+        df["FR_nuclear_dev"]   = (df["FR_nuclear_share"] -
+                                  df["FR_nuclear_share"].rolling(90,
+                                  min_periods=20).mean())
+
+    # More cross-country features 
     if 'DE_load_MW' in df.columns and 'FR_load_MW' in df.columns:
         df['LOAD_IMBALANCE'] = df['DE_load_MW'] - df['FR_load_MW']
+        df['DE_res_load'] = df['DE_load_MW']- df['DE_wind_total'] - df['DE_solar_total']
+        df['FR_res_load'] = df['FR_load_MW']- df['FR_wind_total'] - df['FR_solar_total']
 
     if 'DE_wind_total' in df.columns and 'FR_wind_total' in df.columns:
         df['WIND_IMBALANCE'] = df['DE_wind_total'] - df['FR_wind_total']
+
+
+    # ---- Calendar features —--------
+    # Weekly seasonality is confirmed by error autocorrelation spikes at 7,14,21,28.
+    
+    dates = pd.to_datetime(df["DATE"])
+ 
+    # Cyclic week-of-year (annual seasonality)
+    woy = dates.dt.isocalendar().week.astype(float)
+    #df["week_sin"] = np.sin(2 * np.pi * woy / 52)
+    #df["week_cos"] = np.cos(2 * np.pi * woy / 52)
+    for pref in prefixes:
+        df[f"{pref}_week_sin"] = np.sin(2 * np.pi * woy / 52) #df["week_sin"]
+        df[f"{pref}_week_cos"] = np.cos(2 * np.pi * woy / 52) #df["week_cos"]
+ 
+    # Cyclic day-of-year (finer annual pattern)
+    doy = dates.dt.dayofyear.astype(float)
+    #df["doy_sin"] = np.sin(2 * np.pi * doy / 365)
+    #df["doy_cos"] = np.cos(2 * np.pi * doy / 365)
+    for pref in prefixes:
+        df[f"{pref}_doy_sin"] = np.sin(2 * np.pi * doy / 365) #df["doy_sin"]
+        df[f"{pref}_doy_cos"] = np.cos(2 * np.pi * doy / 365) #df["doy_cos"]
+        
 
     return df
 

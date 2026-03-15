@@ -252,96 +252,154 @@ def add_har_rv_parallel(
 
 
 #---------------------------------------
-# Feature selector -- obsolete, logic needs updating, does not work properly for FR
+# Feature selector -- regime-aware with z-score vol as indicator, rolling windows
 # ----------------------------------------
+
+
+# Calendar stems — forced into union, excluded from selection pool
+_CALENDAR_STEMS = (
+    #[f"dow_{d}" for d in range(7)]
+     #["week_sin", "week_cos"] # "doy_sin", "doy_cos"]
+)
+
+# Shared unprefixed feature stems considered for both country models
+_SHARED_STEMS = [
+    "LOAD_IMBALANCE", "WIND_IMBALANCE",
+    "VOL_SPREAD", "VOL_RATIO",
+]
+
 
 def feature_selection(
     df: pd.DataFrame,
     features: List[str] = None,
     target_de: str = "DE_residual_target",
     target_fr: str = "FR_residual_target",
+    # --- window ---
+    train_window: int = 1200,
     min_train_days: int = 280,
     test_horizon: int = 21,
     gap_days: int = 1,
-    prefilter_top_k: int = 15,
+    # --- selection ---
+    prefilter_top_k: int = 20,
     max_features: int = 10,
+    freq_threshold: float = 0.70,
+    freq_threshold_regime: float = 0.45,
+    # --- vol_zscore regime splitting (optional) ---
+    # When True, each fold is split into high/low vol regime halves using
+    # a rolling zscore of log(realized_vol). Importance scores are collected
+    # separately per regime so the diagnostics show which features matter
+    # in each regime. The zscore is NOT added as a feature.
+    use_vol_zscore: bool = True,
+    vol_zscore_window: int = 252,
+    vol_zscore_threshold: float = 0.5,   # zscore > threshold => high-vol regime
+    # --- forced features (beyond calendar) ---
+    force_features: List[str] = None,
+    # --- model ---
     xgb_params_prefilter: Dict[str, Any] = None,
     n_jobs: int = -1,
-    freq_threshold: float = 0.7,   # keep features appearing in >= fraction of folds
-    verbose: bool = True
+    verbose: bool = True,
 ) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Expanding-window stability selection for prefixed DE_/FR_ features.
-    Returns (selected_union_prefixed, diagnostics_dict).
-    diagnostics contains per-fold train/test metrics, selection counts, mean importances.
 
-    NOTE: If `features` is None, features are autodetected from input dataframe by excluding
-    a small set of leak / meta columns (see exclude_prefixes).
-    """
-    # default xgb params (regularized)
     if xgb_params_prefilter is None:
         xgb_params_prefilter = {
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
-            "max_depth": 3,
-            "eta": 0.03,
-            "subsample": 0.6,
+            "objective":        "reg:squarederror",
+            "eval_metric":      "rmse",
+            "max_depth":        3,
+            "eta":              0.03,
+            "subsample":        0.6,
             "colsample_bytree": 0.5,
-            "lambda": 300,
-            "alpha": 10,
+            "lambda":           300,
+            "alpha":            10,
             "min_child_weight": 30,
-            "seed": SEED,
-            "nthread": 1,
-            "verbosity": 0
+            "seed":             SEED,
+            "nthread":          1,
+            "verbosity":        0,
         }
 
-    # ----------------------------
-    # FEATURE AUTODETECTION (only change)
-    # ----------------------------
-    # If user passed features explicitly, respect it. Otherwise build from df columns
-    # by excluding likely leakage / meta columns.
+    if force_features is None:
+        force_features = []
+
+    # ---- Calendar: only PREFIXED versions, excluded from selection pool ------
+    calendar_forced: List[str] = []
+    for stem in _CALENDAR_STEMS:
+        for pref in ["DE", "FR"]:
+            col = f"{pref}_{stem}"
+            if col in df.columns:
+                calendar_forced.append(col)
+    calendar_forced = list(dict.fromkeys(calendar_forced))
+
+    all_forced = list(dict.fromkeys(calendar_forced + force_features))
+
+    # Set of column names to exclude from selection candidates
+    # (all calendar variants — prefixed and unprefixed)
+    calendar_exclude = set()
+    for stem in _CALENDAR_STEMS:
+        calendar_exclude.add(stem)
+        for pref in ["DE", "FR"]:
+            calendar_exclude.add(f"{pref}_{stem}")
+
+    # ---- Feature autodetection -----------------------------------------------
+    exclude_exact = {
+        "DATE", target_de, target_fr,
+        "DE_garch_sigma", "FR_garch_sigma",
+        "DE_realized_vol","FR_realized_vol"
+        "COUNTRY", "COUNTRY_FLAG",
+        "DE_vol_zscore", "FR_vol_zscore",   # regime signal, not a feature
+        "DE_load_MW", "FR_load_MW",
+        "DE_Wind_Offshore_Actual_Aggregated", "DE_Wind_Onshore_Actual_Aggregated",
+        "FR_Wind_Onshore_Actual_Aggregated","FR_Wind_Offshore_Actual_Aggregated",
+        "FR_doy_cos","FR_doy_sin","FR_week_cos","FR_week_sin", 
+        "DE_doy_cos","DE_doy_sin","DE_week_cos","DE_week_sin",
+        "DE_wind_total", "DE_wind_share", "DE_Hydro_Pumped_Storage_Actual_Consumption"
+        
+        
+    } | calendar_exclude
+
     if features is None:
-        exclude_prefixes = [
-            # general meta
-            "DATE",
-            # targets
-            target_de, target_fr,
-            "DE_garch_sigma", "FR_garch_sigma",
-            #"DE_realized_vol", "FR_realized_vol",
-            # country flag etc
-            "COUNTRY", "COUNTRY_FLAG"
+        candidate_de = [
+            c for c in df.columns
+            if c.startswith("DE_") and c not in exclude_exact
         ]
-
-        # Candidate feature columns: any column not starting with any exclude token
-        candidate_cols = []
-        for col in df.columns:
-            skip = False
-            for ex in exclude_prefixes:
-                # match exact column names or prefix matches where useful
-                if col == ex or col.startswith(ex):
-                    skip = True
-                    break
-            if not skip:
-                candidate_cols.append(col)
-
-        # keep only prefixed DE_/FR_ columns
-        features_de = [c for c in candidate_cols if c.startswith("DE_")]
-        features_fr = [c for c in candidate_cols if c.startswith("FR_")]
-        features = features_de + features_fr
+        candidate_fr = [
+            c for c in df.columns
+            if c.startswith("FR_") and c not in exclude_exact
+        ]
+        shared_in_df = [
+            c for c in _SHARED_STEMS
+            if c in df.columns and c not in exclude_exact
+        ]
+        candidate_de = list(dict.fromkeys(candidate_de + shared_in_df))
+        candidate_fr = list(dict.fromkeys(candidate_fr + shared_in_df))
     else:
-        features_de = [f for f in features if f.startswith("DE_")]
-        features_fr = [f for f in features if f.startswith("FR_")]
+        candidate_de = [
+            f for f in features
+            if f.startswith("DE_") and f not in exclude_exact
+        ]
+        candidate_fr = [
+            f for f in features
+            if f.startswith("FR_") and f not in exclude_exact
+        ]
+        shared_in_feats = [
+            f for f in features
+            if not f.startswith("DE_") and not f.startswith("FR_")
+            and f not in exclude_exact
+        ]
+        candidate_de = list(dict.fromkeys(candidate_de + shared_in_feats))
+        candidate_fr = list(dict.fromkeys(candidate_fr + shared_in_feats))
 
-    # prepare
     df = df.sort_values("DATE").reset_index(drop=True)
     unique_dates = np.sort(df["DATE"].unique())
-    starts = list(range(min_train_days, len(unique_dates) - gap_days - test_horizon + 1, test_horizon))
-    if len(starts) == 0:
-        raise ValueError("Date range too small or min_train_days/test_horizon settings incompatible.")
+
+    starts = list(range(
+        min_train_days,
+        len(unique_dates) - gap_days - test_horizon + 1,
+        test_horizon,
+    ))
+    if not starts:
+        raise ValueError("Date range too small for min_train_days/test_horizon.")
 
     # ---- Helpers -------------------------------------------------------------
     def safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
-        """Spearman with full warning suppression and finite-value guard."""
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
@@ -356,283 +414,407 @@ def feature_selection(
             except Exception:
                 return 0.0
 
-    def evaluate_preds(y_true, preds):
-        mask = (~np.isnan(y_true)) & (~np.isnan(preds))
+    def evaluate_preds(y_true: np.ndarray, preds: np.ndarray) -> dict:
+        mask = np.isfinite(y_true) & np.isfinite(preds)
         if mask.sum() == 0:
-            return {"n":0, "pooled_ic":np.nan, "rmse":np.nan, "mae":np.nan}
-        y = np.array(y_true)[mask]; p = np.array(preds)[mask]
-        return {"n": len(y), "pooled_ic": safe_spearman(p, y), "rmse": float(np.sqrt(mean_squared_error(y, p))), "mae": float(mean_absolute_error(y, p))}
+            return {"n": 0, "pooled_ic": np.nan, "rmse": np.nan, "mae": np.nan}
+        y, p = y_true[mask], preds[mask]
+        return {
+            "n":         int(mask.sum()),
+            "pooled_ic": safe_spearman(p, y),
+            "rmse":      float(np.sqrt(mean_squared_error(y, p))),
+            "mae":       float(mean_absolute_error(y, p)),
+        }
 
-    # fold worker (per fold do both countries)
-    def run_fold(i):
-        train_dates = unique_dates[:i]
-        test_dates = unique_dates[i + gap_days : i + gap_days + test_horizon]
-        if len(test_dates) == 0:
+    # ---- Per-fold vol zscore (training window only) --------------------------
+    def _compute_fold_zscore(fold_df, train_mask, pref):
+        """
+        Returns a boolean Series (same index as fold_df) where True = high-vol
+        regime row. Computed from training window statistics only — no lookahead.
+        Used to split training data for regime-aware importance, NOT as a feature.
+        """
+        rv_col = f"{pref}_realized_vol"
+        if rv_col not in fold_df.columns:
+            return pd.Series(False, index=fold_df.index)
+
+        rv_tr = fold_df.loc[train_mask, rv_col].astype(float).clip(lower=1e-12)
+        log_rv_tr = np.log(rv_tr)
+        mu  = log_rv_tr.rolling(vol_zscore_window, min_periods=30).mean()
+        sig = log_rv_tr.rolling(vol_zscore_window, min_periods=30).std().clip(lower=1e-8)
+        zscore_tr = (log_rv_tr - mu) / sig
+
+        high_vol = pd.Series(False, index=fold_df.index)
+        high_vol.loc[train_mask] = zscore_tr > vol_zscore_threshold
+        return high_vol
+
+    # ---- Fold worker ---------------------------------------------------------
+    def run_fold(i: int) -> Optional[dict]:
+        train_start = max(0, i - train_window) if train_window is not None else 0
+        train_dates = unique_dates[train_start:i]
+        test_dates  = unique_dates[i + gap_days: i + gap_days + test_horizon]
+        if len(train_dates) < min_train_days or len(test_dates) == 0:
             return None
+
         train_mask = df["DATE"].isin(train_dates)
-        test_mask = df["DATE"].isin(test_dates)
+        test_mask  = df["DATE"].isin(test_dates)
+        fold_df    = df   # read-only, no copy needed
+
+        # Regime masks (only used when use_vol_zscore=True)
+        regime_masks = {}
+        if use_vol_zscore:
+            for pref in ["DE", "FR"]:
+                high = _compute_fold_zscore(fold_df, train_mask, pref)
+                regime_masks[pref] = {
+                    "high": train_mask & high,
+                    "low":  train_mask & ~high,
+                }
 
         out = {
             "fold_start_idx": i,
-            "train_from": train_dates[0],
+            "train_from":  train_dates[0],
             "train_until": train_dates[-1],
-            "test_from": test_dates[0],
-            "test_to": test_dates[-1],
+            "test_from":   test_dates[0],
+            "test_to":     test_dates[-1],
             "DE": {},
-            "FR": {}
+            "FR": {},
         }
 
-        # per-country routine
-        def _country_select(prefix_feats, target_col):
+        def _fit_booster(X_tr, y_tr):
+            """Fit one XGBoost with internal val split. Returns (booster, importance) or None."""
+            valid = y_tr.notna() & np.isfinite(y_tr)
+            if valid.sum() < 40:
+                return None, {}
+            X_c = X_tr.loc[valid]; y_c = y_tr.loc[valid].astype(float)
+            val_size = max(int(0.15 * len(X_c)), 15)
+            if len(X_c) <= val_size + 15:
+                return None, {}
+            X_t, X_v = X_c.iloc[:-val_size], X_c.iloc[-val_size:]
+            y_t, y_v = y_c.iloc[:-val_size], y_c.iloc[-val_size:]
+            try:
+                dtrain = xgb.DMatrix(X_t, label=y_t, missing=np.nan)
+                dval   = xgb.DMatrix(X_v, label=y_v, missing=np.nan)
+                bst = xgb.train(
+                    xgb_params_prefilter, dtrain,
+                    num_boost_round=800,
+                    evals=[(dval, "val")],
+                    early_stopping_rounds=40,
+                    verbose_eval=False,
+                )
+                imp = (bst.get_score(importance_type="gain")
+                       or bst.get_score(importance_type="weight")
+                       or {})
+                return bst, imp
+            except Exception:
+                return None, {}
+
+        def _country_select(candidates: List[str], target_col: str,
+                             pref: str) -> dict:
             res = {
-                "prefilter_scores": [],
-                "prefilter_feats": [],
-                "selected_feats": [],
-                "importance": {},
-                "train_metrics": None,
-                "test_metrics": None
+                "prefilter_scores":    [],
+                "prefilter_feats":     [],
+                "selected_feats":      [],
+                "importance":          {},
+                "importance_high_vol": {},
+                "importance_low_vol":  {},
+                "train_metrics":       None,
+                "test_metrics":        None,
             }
-            if target_col not in df.columns:
+            if target_col not in fold_df.columns:
                 return res
 
-            # compute pooled univariate ic on train only
+            train_sub = fold_df.loc[train_mask]
+            y_tr_full = train_sub[target_col].values.astype(float)
+
+            # Univariate Spearman prefilter on full training window
             scores = []
-            train_df = df.loc[train_mask]
-            for feat in prefix_feats:
-                x = train_df[feat].values if feat in train_df.columns else np.array([])
-                y = train_df[target_col].values
-                mask = np.isfinite(x) & np.isfinite(y)
-                ic = safe_spearman(x[mask], y[mask]) if mask.sum()>0 else 0.0
-                scores.append((feat, ic))
+            for feat in candidates:
+                if feat not in train_sub.columns:
+                    scores.append((feat, 0.0))
+                    continue
+                x = train_sub[feat].values.astype(float)
+                scores.append((feat, safe_spearman(x, y_tr_full)))
+
             scores.sort(key=lambda kv: abs(kv[1]), reverse=True)
             res["prefilter_scores"] = scores
-            prefilter_feats = [f for f,_ in scores[:prefilter_top_k]]
+            prefilter_feats = [f for f, _ in scores[:prefilter_top_k]]
             res["prefilter_feats"] = prefilter_feats
-
-            # if no features or no train labels, return
-            if len(prefilter_feats) == 0:
-                return res
-            y_train = df.loc[train_mask, target_col]
-            mask_train = y_train.notna()
-            X_train = df.loc[train_mask, prefilter_feats].loc[mask_train].copy()
-            y_train = y_train.loc[mask_train].copy()
-            if len(X_train) == 0:
+            if not prefilter_feats:
                 return res
 
-            # train xgboost for fold selection
-            try:
-                dtrain = xgb.DMatrix(X_train, label=y_train, missing=np.nan)
-                booster = xgb.train(xgb_params_prefilter, dtrain, num_boost_round=600, verbose_eval=False)
-                importance = booster.get_score(importance_type="gain") or booster.get_score(importance_type="weight")
-            except Exception as e:
-                # training failed for this fold
-                return res
+            X_tr_all = train_sub.reindex(columns=prefilter_feats)
+            y_tr_ser = train_sub[target_col]
 
-            res["importance"] = importance
-            # rank by importance pick top max_features
-            feat_import_sorted = sorted(prefilter_feats, key=lambda fv: importance.get(fv, 0.0), reverse=True)
-            selected = feat_import_sorted[:max_features]
-            res["selected_feats"] = selected
+            # Full-window model (always fitted)
+            bst_full, imp_full = _fit_booster(X_tr_all, y_tr_ser)
+            res["importance"] = imp_full
 
-            # train & evaluate on train (pooled) for diagnostics
-            preds_train = booster.predict(xgb.DMatrix(X_train, missing=np.nan))
-            res["train_metrics"] = evaluate_preds(y_train.values, preds_train)
+            # Regime-split models (only when use_vol_zscore=True)
+            if use_vol_zscore and pref in regime_masks:
+                high_mask = regime_masks[pref]["high"]
+                low_mask  = regime_masks[pref]["low"]
 
-            # evaluate on fold test (rows where target exists)
-            y_test = df.loc[test_mask, target_col]
+                X_high = fold_df.loc[high_mask].reindex(columns=prefilter_feats)
+                y_high = fold_df.loc[high_mask, target_col]
+                X_low  = fold_df.loc[low_mask].reindex(columns=prefilter_feats)
+                y_low  = fold_df.loc[low_mask, target_col]
 
-            # IMPORTANT: booster was trained on prefilter_feats, so we must
-            # pass the same feature set at prediction time.
-            
-            if len(prefilter_feats) > 0:
-                X_test_full = df.loc[test_mask, prefilter_feats].copy()
-            
-                # ensure same column order as training
-                X_test_full = X_test_full.reindex(columns=prefilter_feats)
-            
-                preds_test = booster.predict(
-                    xgb.DMatrix(X_test_full, missing=np.nan)
+                _, imp_high = _fit_booster(X_high, y_high)
+                _, imp_low  = _fit_booster(X_low,  y_low)
+
+                res["importance_high_vol"] = imp_high
+                res["importance_low_vol"]  = imp_low
+
+            # Select top-k by full-window importance
+            if imp_full:
+                feat_sorted = sorted(
+                    prefilter_feats,
+                    key=lambda f: imp_full.get(f, 0.0),
+                    reverse=True,
                 )
-            
-                res["test_metrics"] = evaluate_preds(y_test.values, preds_test)
-            else:
-                res["test_metrics"] = {"n":0, "pooled_ic":np.nan, "rmse":np.nan, "mae":np.nan}
+                res["selected_feats"] = feat_sorted[:max_features]
+
+            # Diagnostics
+            if bst_full is not None:
+                preds_tr = bst_full.predict(xgb.DMatrix(X_tr_all, missing=np.nan))
+                res["train_metrics"] = evaluate_preds(y_tr_full, preds_tr)
+
+                test_sub   = fold_df.loc[test_mask]
+                X_test     = test_sub.reindex(columns=prefilter_feats)
+                y_test     = test_sub[target_col].values.astype(float)
+                preds_test = bst_full.predict(xgb.DMatrix(X_test, missing=np.nan))
+                res["test_metrics"] = evaluate_preds(y_test, preds_test)
 
             return res
 
-        out["DE"] = _country_select(features_de, target_de)
-        out["FR"] = _country_select(features_fr, target_fr)
+        out["DE"] = _country_select(candidate_de, target_de, "DE")
+        out["FR"] = _country_select(candidate_fr, target_fr, "FR")
         return out
 
-    # run folds (parallel)
+    # ---- Run folds -----------------------------------------------------------
     results = Parallel(n_jobs=n_jobs)(delayed(run_fold)(i) for i in starts)
     results = [r for r in results if r is not None]
     n_folds = len(results)
     if n_folds == 0:
         raise ValueError("No folds produced.")
 
-    # aggregate selections and importances
-    sel_counts_de = {}
-    sel_counts_fr = {}
-    agg_importance_de = {}
-    agg_importance_fr = {}
+    # ---- Aggregate -----------------------------------------------------------
+    REGIME_BOUNDARY = pd.Timestamp("2022-01-01")
+
+    sel_counts_de:  Dict[str, int]   = {}
+    sel_counts_fr:  Dict[str, int]   = {}
+    sel_pre_de:     Dict[str, int]   = {}
+    sel_post_de:    Dict[str, int]   = {}
+    sel_pre_fr:     Dict[str, int]   = {}
+    sel_post_fr:    Dict[str, int]   = {}
+
+    agg_imp_de:          Dict[str, float] = {}
+    agg_imp_fr:          Dict[str, float] = {}
+    agg_imp_pre_de:      Dict[str, float] = {}
+    agg_imp_post_de:     Dict[str, float] = {}
+    agg_imp_pre_fr:      Dict[str, float] = {}
+    agg_imp_post_fr:     Dict[str, float] = {}
+    agg_imp_high_de:     Dict[str, float] = {}
+    agg_imp_low_de:      Dict[str, float] = {}
+    agg_imp_high_fr:     Dict[str, float] = {}
+    agg_imp_low_fr:      Dict[str, float] = {}
+
     fold_level_metrics = []
+    n_pre = n_post = 0
 
     for r in results:
-        # DE
-        de = r["DE"]
-        # record fold metrics
+        is_post = int(pd.Timestamp(r["test_from"]) >= REGIME_BOUNDARY)
+        n_post += is_post; n_pre += 1 - is_post
+
+        de, fr = r["DE"], r["FR"]
         fold_level_metrics.append({
-            "train_until": r["train_until"],
-            "test_from": r["test_from"],
-            "test_to": r["test_to"],
-            "DE_train_n": de.get("train_metrics", {}).get("n", 0),
-            "DE_train_ic": de.get("train_metrics", {}).get("pooled_ic", np.nan),
-            "DE_train_rmse": de.get("train_metrics", {}).get("rmse", np.nan),
-            "DE_test_n": de.get("test_metrics", {}).get("n", 0),
-            "DE_test_ic": de.get("test_metrics", {}).get("pooled_ic", np.nan),
-            "DE_test_rmse": de.get("test_metrics", {}).get("rmse", np.nan),
+            "train_from":    r["train_from"],
+            "train_until":   r["train_until"],
+            "test_from":     r["test_from"],
+            "test_to":       r["test_to"],
+            "DE_train_ic":   de.get("train_metrics", {}).get("pooled_ic", np.nan),
+            "DE_train_rmse": de.get("train_metrics", {}).get("rmse",      np.nan),
+            "DE_test_ic":    de.get("test_metrics",  {}).get("pooled_ic", np.nan),
+            "DE_test_rmse":  de.get("test_metrics",  {}).get("rmse",      np.nan),
+            "FR_train_ic":   fr.get("train_metrics", {}).get("pooled_ic", np.nan),
+            "FR_train_rmse": fr.get("train_metrics", {}).get("rmse",      np.nan),
+            "FR_test_ic":    fr.get("test_metrics",  {}).get("pooled_ic", np.nan),
+            "FR_test_rmse":  fr.get("test_metrics",  {}).get("rmse",      np.nan),
         })
-        for f in de.get("selected_feats", []):
-            sel_counts_de[f] = sel_counts_de.get(f, 0) + 1
-        for k,v in (de.get("importance") or {}).items():
-            agg_importance_de[k] = agg_importance_de.get(k, 0.0) + float(v)
 
-        # FR
-        fr = r["FR"]
-        fold_level_metrics[-1].update({
-            "FR_train_n": fr.get("train_metrics", {}).get("n", 0),
-            "FR_train_ic": fr.get("train_metrics", {}).get("pooled_ic", np.nan),
-            "FR_train_rmse": fr.get("train_metrics", {}).get("rmse", np.nan),
-            "FR_test_n": fr.get("test_metrics", {}).get("n", 0),
-            "FR_test_ic": fr.get("test_metrics", {}).get("pooled_ic", np.nan),
-            "FR_test_rmse": fr.get("test_metrics", {}).get("rmse", np.nan),
-        })
-        for f in fr.get("selected_feats", []):
-            sel_counts_fr[f] = sel_counts_fr.get(f, 0) + 1
-        for k,v in (fr.get("importance") or {}).items():
-            agg_importance_fr[k] = agg_importance_fr.get(k, 0.0) + float(v)
+        def _accum(sel_counts, sel_pre, sel_post, agg_imp, agg_pre, agg_post,
+                   agg_high, agg_low, country_res):
+            for f in country_res.get("selected_feats", []):
+                sel_counts[f] = sel_counts.get(f, 0) + 1
+                if is_post: sel_post[f] = sel_post.get(f, 0) + 1
+                else:        sel_pre[f]  = sel_pre.get(f,  0) + 1
+            for k, v in (country_res.get("importance") or {}).items():
+                v = float(v)
+                agg_imp[k]  = agg_imp.get(k, 0.0)  + v
+                agg_post[k] = agg_post.get(k, 0.0) + v * is_post
+                agg_pre[k]  = agg_pre.get(k,  0.0) + v * (1 - is_post)
+            for k, v in (country_res.get("importance_high_vol") or {}).items():
+                agg_high[k] = agg_high.get(k, 0.0) + float(v)
+            for k, v in (country_res.get("importance_low_vol") or {}).items():
+                agg_low[k] = agg_low.get(k, 0.0) + float(v)
 
-    # normalize aggregated importance by number of folds where present
-    mean_importance_de = {k: v / float(n_folds) for k,v in agg_importance_de.items()}
-    mean_importance_fr = {k: v / float(n_folds) for k,v in agg_importance_fr.items()}
+        _accum(sel_counts_de, sel_pre_de, sel_post_de,
+               agg_imp_de, agg_imp_pre_de, agg_imp_post_de,
+               agg_imp_high_de, agg_imp_low_de, de)
+        _accum(sel_counts_fr, sel_pre_fr, sel_post_fr,
+               agg_imp_fr, agg_imp_pre_fr, agg_imp_post_fr,
+               agg_imp_high_fr, agg_imp_low_fr, fr)
 
-    # compute selection frequency
-    freq_de = {k: sel_counts_de.get(k, 0) / float(n_folds) for k in features_de}
-    freq_fr = {k: sel_counts_fr.get(k, 0) / float(n_folds) for k in features_fr}
+    # Normalise
+    def _norm(d, n): return {k: v / n for k, v in d.items()}
+    mean_imp_de      = _norm(agg_imp_de,      n_folds)
+    mean_imp_fr      = _norm(agg_imp_fr,      n_folds)
+    mean_imp_pre_de  = _norm(agg_imp_pre_de,  max(n_pre,  1))
+    mean_imp_post_de = _norm(agg_imp_post_de, max(n_post, 1))
+    mean_imp_pre_fr  = _norm(agg_imp_pre_fr,  max(n_pre,  1))
+    mean_imp_post_fr = _norm(agg_imp_post_fr, max(n_post, 1))
+    mean_imp_high_de = _norm(agg_imp_high_de, n_folds)
+    mean_imp_low_de  = _norm(agg_imp_low_de,  n_folds)
+    mean_imp_high_fr = _norm(agg_imp_high_fr, n_folds)
+    mean_imp_low_fr  = _norm(agg_imp_low_fr,  n_folds)
 
-    # choose stable features based on freq_threshold or at least top by frequency if none meet threshold
-    stable_de = [f for f,frq in freq_de.items() if frq >= freq_threshold]
-    stable_fr = [f for f,frq in freq_fr.items() if frq >= freq_threshold]
+    # Frequencies
+    all_feats_de = list(dict.fromkeys(candidate_de))
+    all_feats_fr = list(dict.fromkeys(candidate_fr))
 
-    # fallback: if stable empty, pick top-k by frequency up to max_features
-    def fallback_top(freq_map, k):
-        # choose correct importance map depending on feature origin
-        importance_map = mean_importance_de if any(k in mean_importance_de for k in freq_map) else mean_importance_fr
-        sorted_by_freq = sorted(freq_map.items(), key=lambda kv: (kv[1], importance_map.get(kv[0],0.0)), reverse=True)
-        return [kv[0] for kv in sorted_by_freq[:k]]
+    freq_de      = {k: sel_counts_de.get(k, 0) / n_folds       for k in all_feats_de}
+    freq_fr      = {k: sel_counts_fr.get(k, 0) / n_folds       for k in all_feats_fr}
+    freq_pre_de  = {k: sel_pre_de.get(k, 0)  / max(n_pre, 1)   for k in all_feats_de}
+    freq_post_de = {k: sel_post_de.get(k, 0) / max(n_post, 1)  for k in all_feats_de}
+    freq_pre_fr  = {k: sel_pre_fr.get(k, 0)  / max(n_pre, 1)   for k in all_feats_fr}
+    freq_post_fr = {k: sel_post_fr.get(k, 0) / max(n_post, 1)  for k in all_feats_fr}
 
-    if len(stable_de) == 0:
-        stable_de = fallback_top(freq_de, max_features)
-    if len(stable_fr) == 0:
-        stable_fr = fallback_top(freq_fr, max_features)
+    # Regime-aware stability: global OR per-regime threshold
+    def _stable(f, freq, freq_pre, freq_post):
+        return (freq.get(f, 0)      >= freq_threshold
+                or freq_pre.get(f, 0)  >= freq_threshold_regime
+                or freq_post.get(f, 0) >= freq_threshold_regime)
 
-    # cap to max_features each
-    stable_de = stable_de[:max_features]
-    stable_fr = stable_fr[:max_features]
+    stable_de = [f for f in all_feats_de if _stable(f, freq_de, freq_pre_de, freq_post_de)]
+    stable_fr = [f for f in all_feats_fr if _stable(f, freq_fr, freq_pre_fr, freq_post_fr)]
 
-    # union
-    selected_union = list(dict.fromkeys(stable_de + stable_fr))
+    def _fallback(freq_map, imp_map, k):
+        return [f for f, _ in sorted(
+            freq_map.items(),
+            key=lambda kv: (kv[1], imp_map.get(kv[0], 0.0)),
+            reverse=True,
+        )[:k]]
 
+    if not stable_de: stable_de = _fallback(freq_de, mean_imp_de, max_features)
+    if not stable_fr: stable_fr = _fallback(freq_fr, mean_imp_fr, max_features)
+
+    stable_de = sorted(stable_de, key=lambda f: mean_imp_de.get(f, 0), reverse=True)[:max_features]
+    stable_fr = sorted(stable_fr, key=lambda f: mean_imp_fr.get(f, 0), reverse=True)[:max_features]
+
+    # Final union: selected + forced calendar (prefixed only) + extra forced
+    selected_union = list(dict.fromkeys(stable_de + stable_fr + all_forced))
+
+    # ---- Diagnostics ---------------------------------------------------------
     diagnostics = {
-        "n_folds": n_folds,
-        "folds": pd.DataFrame(fold_level_metrics),
-        "freq_de": freq_de,
-        "freq_fr": freq_fr,
-        "mean_importance_de": mean_importance_de,
-        "mean_importance_fr": mean_importance_fr,
-        "stable_de": stable_de,
-        "stable_fr": stable_fr,
-        "selected_union": selected_union,
-        "raw_fold_results": results
+        "n_folds":           n_folds,
+        "n_pre_folds":       n_pre,
+        "n_post_folds":      n_post,
+        "folds":             pd.DataFrame(fold_level_metrics),
+        "freq_de":           freq_de,
+        "freq_fr":           freq_fr,
+        "freq_pre_de":       freq_pre_de,
+        "freq_post_de":      freq_post_de,
+        "freq_pre_fr":       freq_pre_fr,
+        "freq_post_fr":      freq_post_fr,
+        "mean_imp_de":       mean_imp_de,
+        "mean_imp_fr":       mean_imp_fr,
+        "mean_imp_pre_de":   mean_imp_pre_de,
+        "mean_imp_post_de":  mean_imp_post_de,
+        "mean_imp_pre_fr":   mean_imp_pre_fr,
+        "mean_imp_post_fr":  mean_imp_post_fr,
+        "mean_imp_high_de":  mean_imp_high_de,
+        "mean_imp_low_de":   mean_imp_low_de,
+        "mean_imp_high_fr":  mean_imp_high_fr,
+        "mean_imp_low_fr":   mean_imp_low_fr,
+        "stable_de":         stable_de,
+        "stable_fr":         stable_fr,
+        "calendar_forced":   calendar_forced,
+        "selected_union":    selected_union,
+        "raw_fold_results":  results,
+        # legacy keys
+        "mean_importance_de": mean_imp_de,
+        "mean_importance_fr": mean_imp_fr,
     }
 
-
-
-    # ---------- print diagnostics ----------
+    # ---- Verbose output ------------------------------------------------------
     if verbose:
         folds_df = diagnostics["folds"]
-        n_folds = diagnostics["n_folds"]
+        def _cm(col):
+            return float(folds_df[col].dropna().mean()) if col in folds_df else np.nan
 
-        # avg prefilter kept / avg selected per fold (DE / FR) from raw_fold_results
-        raw = diagnostics.get("raw_fold_results", [])
-        pref_counts_de = []
-        sel_counts_de = []
-        pref_counts_fr = []
-        sel_counts_fr = []
-        for r in raw:
-            de = r.get("DE", {})
-            fr = r.get("FR", {})
-            pref_counts_de.append(len(de.get("prefilter_feats", [])))
-            sel_counts_de.append(len(de.get("selected_feats", [])))
-            pref_counts_fr.append(len(fr.get("prefilter_feats", [])))
-            sel_counts_fr.append(len(fr.get("selected_feats", [])))
-
-        avg_prefilter_de = float(np.mean(pref_counts_de)) if len(pref_counts_de)>0 else 0
-        avg_selected_de = float(np.mean(sel_counts_de)) if len(sel_counts_de)>0 else 0
-        avg_prefilter_fr = float(np.mean(pref_counts_fr)) if len(pref_counts_fr)>0 else 0
-        avg_selected_fr = float(np.mean(sel_counts_fr)) if len(sel_counts_fr)>0 else 0
-
-        # fold-level aggregated train / test metrics (mean across folds)
-        def _col_mean(df, col):
-            return float(df[col].dropna().mean()) if (col in df and df[col].notna().sum()>0) else np.nan
-
-        de_train_ic_mean = _col_mean(folds_df, "DE_train_ic")
-        de_test_ic_mean  = _col_mean(folds_df, "DE_test_ic")
-        de_train_rmse_mean = _col_mean(folds_df, "DE_train_rmse")
-        de_test_rmse_mean  = _col_mean(folds_df, "DE_test_rmse")
-
-        fr_train_ic_mean = _col_mean(folds_df, "FR_train_ic")
-        fr_test_ic_mean  = _col_mean(folds_df, "FR_test_ic")
-        fr_train_rmse_mean = _col_mean(folds_df, "FR_train_rmse")
-        fr_test_rmse_mean  = _col_mean(folds_df, "FR_test_rmse")
-
-        # stable selections & union
-        stable_de = diagnostics.get("stable_de", [])
-        stable_fr = diagnostics.get("stable_fr", [])
-        selected_union = diagnostics.get("selected_union", [])
-
-        # mean importance (sorted) helper
-        mean_imp_de = diagnostics.get("mean_importance_de", {})
-        mean_imp_fr = diagnostics.get("mean_importance_fr", {})
-        top_imp_de = sorted(mean_imp_de.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        top_imp_fr = sorted(mean_imp_fr.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        raw = results
+        avg_pf_de = np.mean([len(r["DE"].get("prefilter_feats", [])) for r in raw])
+        avg_sl_de = np.mean([len(r["DE"].get("selected_feats",  [])) for r in raw])
+        avg_pf_fr = np.mean([len(r["FR"].get("prefilter_feats", [])) for r in raw])
+        avg_sl_fr = np.mean([len(r["FR"].get("selected_feats",  [])) for r in raw])
 
         print("\n=== FEATURE SELECTION DIAGNOSTICS ===")
-        print("Folds:", n_folds)
-        print(f"Avg prefilter kept: DE={avg_prefilter_de:.1f}, FR={avg_prefilter_fr:.1f}")
-        print(f"Avg selected (per fold): DE={avg_selected_de:.1f}, FR={avg_selected_fr:.1f}")
-        print("Union selected count:", len(selected_union))
+        print(f"Folds: {n_folds}  (pre-2022: {n_pre}, post-2022: {n_post})")
+        print(f"Train window: {train_window} days ({'rolling' if train_window else 'expanding'})")
+        print(f"Freq threshold: global={freq_threshold}, per-regime={freq_threshold_regime}")
+        print(f"Vol zscore regime split: {use_vol_zscore}")
+        print(f"Avg prefilter kept: DE={avg_pf_de:.1f}, FR={avg_pf_fr:.1f}")
+        print(f"Avg selected per fold: DE={avg_sl_de:.1f}, FR={avg_sl_fr:.1f}")
+        print(f"Stable DE: {len(stable_de)}  Stable FR: {len(stable_fr)}")
+        print(f"Calendar features forced (prefixed only): {len(calendar_forced)}")
+        print(f"Union total: {len(selected_union)}")
 
-        print("\n--- Fold-averaged pooled metrics (mean over folds) ---")
-        print("DE: train pooled IC / RMSE  :", np.round(de_train_ic_mean, 4), np.round(de_train_rmse_mean, 4))
-        print("DE: test  pooled IC / RMSE  :", np.round(de_test_ic_mean, 4), np.round(de_test_rmse_mean, 4))
-        print("FR: train pooled IC / RMSE  :", np.round(fr_train_ic_mean, 4), np.round(fr_train_rmse_mean, 4))
-        print("FR: test  pooled IC / RMSE  :", np.round(fr_test_ic_mean, 4), np.round(fr_test_rmse_mean, 4))
+        print("\n--- Fold-averaged metrics ---")
+        print(f"DE: train IC={_cm('DE_train_ic'):.4f}  test IC={_cm('DE_test_ic'):.4f}  "
+              f"gap={_cm('DE_train_ic') - _cm('DE_test_ic'):.4f}")
+        print(f"FR: train IC={_cm('FR_train_ic'):.4f}  test IC={_cm('FR_test_ic'):.4f}  "
+              f"gap={_cm('FR_train_ic') - _cm('FR_test_ic'):.4f}")
 
-        print("\nTop stable DE selected features (stable_de):", stable_de)
-        print("Top stable FR selected features (stable_fr):", stable_fr)
-        print("Final union (selected_union):", selected_union)
+        print("\nStable DE features:", stable_de)
+        print("Stable FR features:", stable_fr)
+        print("Forced calendar (prefixed):", calendar_forced)
+        print("Final union:", selected_union)
 
-        print("\nTop mean importance (DE):")
-        for f, v in top_imp_de:
-            print(" ", f, ":", float(v))
-        print("\nTop mean importance (FR):")
-        for f, v in top_imp_fr:
-            print(" ", f, ":", float(v))
+        def _top(d, n=10):
+            return sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
 
+        print("\nTop importance DE (all folds):")
+        for f, v in _top(mean_imp_de): print(f"  {f}: {v:.4f}")
+
+        print("\nTop importance FR — post-2022:")
+        for f, v in _top(mean_imp_post_fr): print(f"  {f}: {v:.4f}")
+
+        print("\nTop importance FR — pre-2022:")
+        for f, v in _top(mean_imp_pre_fr): print(f"  {f}: {v:.4f}")
+
+        if use_vol_zscore:
+            print("\nTop importance DE — high-vol regime:")
+            for f, v in _top(mean_imp_high_de): print(f"  {f}: {v:.4f}")
+            print("\nTop importance DE — low-vol regime:")
+            for f, v in _top(mean_imp_low_de): print(f"  {f}: {v:.4f}")
+            print("\nTop importance FR — high-vol regime:")
+            for f, v in _top(mean_imp_high_fr): print(f"  {f}: {v:.4f}")
+            print("\nTop importance FR — low-vol regime:")
+            for f, v in _top(mean_imp_low_fr): print(f"  {f}: {v:.4f}")
+
+        shared_selected = [f for f in selected_union if f in _SHARED_STEMS]
+        if shared_selected:
+            print("\nShared cross-country features selected:", shared_selected)
+
+        # FR nuclear check
+        nuc_feats = [f for f in selected_union if "nuclear" in f.lower()]
+        print(f"\nFR nuclear in union: {nuc_feats if nuc_feats else 'NONE — check freq_post_fr'}")
+        if not nuc_feats:
+            nuc_candidates = {k: v for k, v in freq_post_fr.items() if "nuclear" in k.lower()}
+            print(f"  Post-2022 freq for nuclear features: {nuc_candidates}")
 
     return selected_union, diagnostics
+
+
 
 #################################################
 #################################################
@@ -914,17 +1096,21 @@ def two_regime_rolling_cv_per_country(
                         f"Call add_regime_probs_to_panel() before the CV."
                     )
 
-    # ------------------------------------------------------------------ helpers
-    def safe_spearman(a, b):
-        try:
-            a = np.asarray(a, dtype=float)
-            b = np.asarray(b, dtype=float)
-            mask = np.isfinite(a) & np.isfinite(b)
-            if mask.sum() < 5:
-                return np.nan
-            return float(spearmanr(a[mask], b[mask]).correlation)
-        except Exception:
-            return np.nan
+    # ---- Helpers -------------------------------------------------------------
+    def safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                mask = np.isfinite(x) & np.isfinite(y)
+                if mask.sum() < 5:
+                    return 0.0
+                xs, ys = x[mask], y[mask]
+                if np.std(xs) < 1e-12 or np.std(ys) < 1e-12:
+                    return 0.0
+                r = spearmanr(xs, ys).correlation
+                return 0.0 if not np.isfinite(r) else float(r)
+            except Exception:
+                return 0.0
 
     def _recency_weights(n: int, halflife: int) -> np.ndarray:
         decay = np.log(2) / halflife

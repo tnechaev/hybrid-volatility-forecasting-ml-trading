@@ -252,7 +252,8 @@ def evaluate_trading_performance(bt):
         'pnl_before_cost': bt['pnl_before_cost'].sum(),
         'n_days': len(daily_pnl)
     }
-    
+    cost_cov_rat =  bt['pnl_before_cost'].sum()/total_cost
+
     print("=== Trading Performance ===")
     print(f"Sharpe Ratio: {sharpe:.4f}")
     print(f"Max Drawdown: {max_dd:.4f}")
@@ -261,5 +262,6 @@ def evaluate_trading_performance(bt):
     print(f"Total PnL: {total_pnl:.6f}")
     print(f"Total Cost: {total_cost:.6f}")
     print(f"PnL Before Cost: {metrics['pnl_before_cost']:.6f}")
+    print(f"Cost Coverage Ratio: {cost_cov_rat:.6f}")
     
     return metrics, daily_pnl

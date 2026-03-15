@@ -13,13 +13,17 @@ The approach combines:
 
 The objective is **relative ranking of volatility (cross-sectional signal extraction)** , not precise level prediction.
 
-> Research-grade project, work in progress! 
+### Research-grade project, work in progress! 
 
 ## WHAT'S NEW
 
-- **03.03.2026** 
-- Tested **rolling-window** XGBoost (expanding window functionality kept). Motivation: when regimes change persistently, better not to overuse old data. **Result**: improved IC by 0.3 points (pooled and per-country) compared to exp. window.
-- Optuna for XGBoost hyperparameter optimization, trained/tested on post-2022 regime. Result: overfitting gap improved (FR, DE 0.15, 0.11 vs 0.21, 0.16). However, optimization ideally needs to run in the main CV function.
+**15.03.2026** 
+-  Added more engineered features, reduced redundancy in final selection
+- Mostly fixed weekly autocorrelation error pattern
+
+ **03.03.2026** 
+-  **rolling-window** XGBoost (expanding window functionality kept). Motivation: when regimes change persistently, better not to overuse old data. **Result**: improved IC by 0.3 points (pooled and per-country) compared to exp. window.
+- Optuna for XGBoost hyperparameter optimization, trained/tested on post-2022 regime. **Result**: overfitting gap improved (FR, DE 0.15, 0.11 vs 0.21, 0.16).
 
 **01.03.2026** -- This a **major update** of the previous work. Most significant changes:
 - **Historical data** from **01.2015 to 02.2026** (previously -- pre-aggregated small data sample from a ML competition).  
@@ -44,10 +48,9 @@ All data is then re-aggregated into daily. Realized volatility and log prices ar
 ### Primary Metric
 - **Spearman rank correlation (Information Coefficient)**
 - The model is evaluated on its ability to produce correct cross-sectional rank ordering. 
-- RMSE and MAE are also implemented, but are currently **not used as an absolute metric**, rather as a relative metric for tracking model improvements. They might also be used directly in the future project updates.
 
 ### Validation Layers
-- Statistical validation (rank IC, residual ACF, stability checks)
+- Statistical validation (rank IC, residual ACF, overfit and stability checks)
 - Economic validation (market-neutral trading strategy with transaction costs)
 
 ---
@@ -101,6 +104,8 @@ Features are designed to reflect structural system regimes. Currently very minim
 - Seasonality
 - Load history
 
+**Residual load** = Load - Wind Generation - Solar Generation
+
 All features are constructed to avoid forward-looking bias.
 
 ---
@@ -116,9 +121,9 @@ All features are constructed to avoid forward-looking bias.
 
 | Metric | Value |
 |--------|-------|
-| Pooled IC (ML) | 0.35 |
+| Pooled IC (ML) | 0.33 |
 | DE IC (ML) | 0.39 |
-| FR IC (ML) | 0.30 |
+| FR IC (ML) | 0.28 |
 | DE IC (baseline) | 0.67 |
 | FR IC (baseline) | 0.67 |
 
@@ -144,21 +149,19 @@ All features are constructed to avoid forward-looking bias.
 
 | Metric               | Value |
 |----------------------|-------|
-| Sharpe Ratio         | 1.85  |
-| Max Drawdown         |-4.12 |
-| Avg Daily Turnover   | 0.85 |
-| Win Rate | 45.67% |
-| Cost coverage ratio | 7.64 |
+| Sharpe Ratio         | 2.09  |
+| Max Drawdown         |-5.36 |
+| Avg Daily Turnover   | 0.90 |
+| Win Rate | 44.73% |
+| Cost coverage ratio | 8.30 |
 ---
 
 # Current issues and next steps:
 
-- Fix feature selector to rolling windows, regime separation -- right now it does not work properly for France
-- Add and test more engineered features (very few basic are in use now)
-- Add generation forecasts/outages / their errors as features
+- Run Optuna hyperparameter optimization inside rolling CV
+- Add generation forecasts/outages / errors as features -- makes it more realistic
+- Adjust parallelization algorithm to include additional CPU cores/clusters when available
 - More realistic execution modeling (slippage, realistic fees) for trading strategy
-- Improve diagnostic plots (think of more informative per-fold ones, if possible)
-
 
 ---
 

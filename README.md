@@ -1,5 +1,14 @@
 # Filtered (Residual) Volatility Forecasting with Machine Learning and Trading
 
+- [Overview](#Overview)
+- [WHAT'S NEW](#WHAT'S NEW)
+- [Data](#Data)
+- [Model Architecture](#Model Architecture)
+- [Results (Baseline + ML in rolling window walk-forward CV)](#Results (Baseline + ML in rolling window walk-forward CV))
+- [Trading Framework](#Trading Framework)
+- [Trading Results (OOS, incl. costs)](#Trading Results (OOS, incl. costs))
+- [Current issues and next steps](#Current issues and next steps)
+
 ## Overview
 
 This project implements a **hybrid volatility forecasting framework**  (day-ahead) in Germany and France power markets. Please see **demo.ipynb** for the full demonstration with graphics and diagnostics output.
@@ -158,7 +167,7 @@ All features are constructed to avoid forward-looking bias.
 | Cost coverage ratio | 9.3 |
 ---
 
-# Current issues and next steps:
+# Current issues and next steps
 
 - Add generation **forecasts**/outages / errors as features -- makes it more realistic
 - More realistic execution modeling (slippage, realistic fees) for trading strategy

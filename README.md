@@ -168,8 +168,13 @@ All features are constructed to avoid forward-looking bias.
 
 # Current issues and next steps
 
-- Add generation **forecasts**/outages / errors as features -- makes it more realistic
-- More realistic execution modeling (slippage, realistic fees) for trading strategy
+- Add generation **forecasts**/outages / errors as features
+- Trading strategy has a few issues:
+	- P&L is dimensionless  -- need to define a notional and scale accordingly
+	- Cost estimates should be more realistic; slippage should also be added
+	- The performance in "calm" regimes is significantly worse than in crisis regimes (not nonsensical but not interesting either) ->
+	- Blended strategy with spread trading, reduced positions and stop-loss for "calm" regimes yields minor improvement ->
+	- Will add an intraday strategy -- shorter horizon, cleaner signal + more realistic 
 
 ---
 

@@ -10,6 +10,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from joblib import Parallel, delayed, parallel_backend
 from typing import Sequence, List, Dict, Any, Tuple, Optional
 from hmmlearn.hmm import GaussianHMM
+from hmmlearn.hmm import GMMHMM
 from sklearn.preprocessing import StandardScaler
 import gc
 import optuna
@@ -814,8 +815,7 @@ def feature_selection(
             print(f"  Post-2022 freq for nuclear features: {nuc_candidates}")
 
     return selected_union, diagnostics
-
-
+    
 
 #################################################
 #################################################
@@ -824,7 +824,7 @@ def feature_selection(
 #################################################
 
 # =============================================================================
-# 1. detect_markov_regime — filtered probs
+# detect_markov_regime — filtered probs
 # =============================================================================
 
 def detect_markov_regime(
@@ -861,13 +861,22 @@ def detect_markov_regime(
         X_fit = scaler.fit_transform(X)
     else:
         X_fit = X.copy()
-
+    """
     model = GaussianHMM(
         n_components=n_states,
         covariance_type="full",
         n_iter=1000,
         random_state=random_state,
+    )"""
+
+    model = GMMHMM(
+        n_components=n_states,      # number of hidden states
+        n_mix=2,                    # Gaussian mixture components per state
+        covariance_type="full",
+        n_iter=1000,
+        random_state=random_state,
     )
+    
     model.fit(X_fit)
 
     # ------------------------------------------------------------------
@@ -936,7 +945,7 @@ def detect_markov_regime(
 
 
 # =============================================================================
-# 2. add_regime_probs_to_panel — fit once, attach to panel before CV
+# add_regime_probs_to_panel — fit once, attach to panel before CV
 # =============================================================================
 
 def add_regime_probs_to_panel(
@@ -1008,16 +1017,62 @@ def add_regime_probs_to_panel(
 
 
 # =============================================================================
-# 3. two_regime_rolling_cv_per_country
+# Regime detection vol z-score (shared between CV and trading)
 # =============================================================================
 
-try:
-    import optuna
-    optuna.logging.set_verbosity(optuna.logging.ERROR)
-    _OPTUNA_AVAILABLE = True
-except ImportError:
-    _OPTUNA_AVAILABLE = False
+def compute_vol_regime_flag(
+    panel: pd.DataFrame,
+    rv_col_template: str = '{pref}_realized_vol',
+    window: int = 252,          
+    threshold: float = 0.5,     
+    min_periods: int = 30,
+    prefixes: list = None,
+) -> pd.DataFrame:
+    """
+    Compute per-country vol regime flag from log(realized_vol) z-score.
+    
+    Consistent with the trading strategy regime detection.
+    Both use: zscore = (log_rv - rolling_mean(window)) / rolling_std(window)
+    Both use shift(1) for no-lookahead.
+    
+    Returns panel with added columns:
+        {pref}_vol_regime_zscore  : raw z-score
+        {pref}_vol_regime_flag    : 1 = high-vol, 0 = calm
+    
+    Pass this panel to two_regime_rolling_cv_per_country so the CV sees
+    the same regime labels as the trading strategy.
+    """
+    if prefixes is None:
+        prefixes = ['DE', 'FR']
+    
+    df = panel.copy()
+    df = df.sort_values('DATE').reset_index(drop=True)
+    
+    for pref in prefixes:
+        rv_col = rv_col_template.format(pref=pref)
+        if rv_col not in df.columns:
+            print(f"WARNING: {rv_col} not found — skipping {pref}")
+            continue
+        
+        log_rv = np.log(df[rv_col].astype(float).clip(lower=1e-12))
+        mu  = log_rv.rolling(window, min_periods=min_periods).mean().shift(1)
+        sig = log_rv.rolling(window, min_periods=min_periods).std().shift(1).clip(lower=1e-8)
+        zs  = (log_rv - mu) / sig
+        
+        df[f'{pref}_vol_regime_zscore'] = zs
+        df[f'{pref}_vol_regime_flag']   = (zs > threshold).astype(int)
+        
+        pct_high = (df[f'{pref}_vol_regime_flag'] == 1).mean()
+        print(f"{pref}: {pct_high:.1%} of days flagged as high-vol "
+              f"(threshold={threshold}, window={window})")
+    
+    return df
 
+
+# =============================================================================
+# Regime-conditional CV
+# Two targets: high-vol uses HAR-RV residual, calm uses log(rv) level
+# =============================================================================
 
 def two_regime_rolling_cv_per_country(
     df: pd.DataFrame,
@@ -1033,6 +1088,15 @@ def two_regime_rolling_cv_per_country(
     xgb_params: Dict[str, Any] = None,
     n_jobs: int = -1,
     min_samples_per_regime: int = 50,
+    # --- regime-conditional targets ---
+    # When True, calm-period folds train on log(rv) level instead of HAR residual.
+    # This directly targets the predictable component in calm markets.
+    # The predictions are stored in separate columns: pred_hv / pred_calm.
+    use_regime_targets: bool = True,
+    vol_regime_window: int = 252,
+    vol_regime_threshold: float = 0.5,
+    calm_target_de: str = "DE_log_rv_target",   # log(rv_t+1) 
+    calm_target_fr: str = "FR_log_rv_target",
     # --- Markov ---
     use_markov: Dict[str, bool] = None,
     k_regimes: int = 2,
@@ -1043,22 +1107,30 @@ def two_regime_rolling_cv_per_country(
     # --- Recency weighting ---
     use_recency_weights: bool = False,
     recency_halflife: int = 180,
-    # --- Per-fold Optuna optimisation ---
-    # When True, each fold runs a small Optuna study on its own training
-    # window inner-val split before fitting the final model.
-    # Optuna only sees training data — no lookahead.
-    # n_optuna_trials: number of trials per fold per country.
-    #   20-30 is fast and usually sufficient; 50+ gives more thorough search.
-    # optuna_val_frac: fraction of training window used as inner val for Optuna.
-    #   Default 0.15 matches train_xgb_safe's internal val split.
+    # --- Optuna ---
     use_optuna: bool = True,
     n_optuna_trials: int = 25,
     optuna_val_frac: float = 0.15,
-    # kept for backward compat
     detect_kwargs: Dict[str, Any] = None,
 ) -> tuple:
     """
-    Rolling walk-forward CV, per-country XGBoost on HAR-RV residuals.
+    Rolling walk-forward CV with optional regime-conditional targets.
+    
+    REGIME-CONDITIONAL TARGETS (use_regime_targets=True)
+    
+    High-vol folds: predict HAR-RV residual (original target)
+        Edge: XGBoost corrects HAR-RV systematic errors during crises
+    Calm folds: predict log(rv_t+1) directly
+        Edge: generation mix / weather predict vol level in calm markets
+              even when the HAR residual is near-zero noise
+    
+    The regime flag for each fold is computed from the training window only.
+    A fold is "high-vol" if the test period's regime,
+    estimated from training data, suggests high-vol.
+    
+    Output: all_preds contains pred_hv (HAR residual prediction) and
+    pred_calm (log-rv prediction) as separate columns, plus pred which
+    is the regime-appropriate prediction for that fold.
 
     SHARED (UNPREFIXED) FEATURES
         Features in `features` that do not start with 'DE_' or 'FR_' are
@@ -1083,21 +1155,11 @@ def two_regime_rolling_cv_per_country(
         The CV fold simply reads the prob value for each training/test row;
         test rows are filled with the last training-period value (causal fill).
         If use_per_regime_models=True, two XGBoost models are trained per
-        country, soft-weighted by the regime probability.
-
-    VOL ZSCORE
-        Computed in each fold from the training window only.
-        Formula: zscore_t = (log_rv_t - rolling_mean) / rolling_std
-        where mean and std use vol_zscore_window days of training history.
-        Test rows are filled with the zscore computed using the last
-        training-window statistics (causal fill, same logic as Markov).
-        Adds {pref}_vol_zscore as an extra feature column for that fold.
-
-    Both options are fully independent.
+        country, soft-weighted by the regime probability.   
     """
 
     if not _OPTUNA_AVAILABLE and use_optuna:
-        raise ImportError("optuna is required for use_optuna=True. pip install optuna")
+        raise ImportError("pip install optuna")
 
     if xgb_params is None:
         xgb_params = {
@@ -1114,46 +1176,34 @@ def two_regime_rolling_cv_per_country(
     df = df.sort_values('DATE').reset_index(drop=True)
     unique_dates = np.sort(df['DATE'].unique())
 
-    # ----------------------------------------------------------------
-    # Feature list split: DE_*, FR_*, and shared (unprefixed)
-    # Shared features are appended to both country lists each fold.
-    # ----------------------------------------------------------------
     features_de_base     = [f for f in features if f.startswith("DE_")]
     features_fr_base     = [f for f in features if f.startswith("FR_")]
     features_shared_base = [
         f for f in features
         if not f.startswith("DE_") and not f.startswith("FR_")
-        and f in df.columns   # only include if actually present in df
+        and f in df.columns
     ]
 
     if not features_de_base or not features_fr_base:
         raise ValueError("features must contain both DE_ and FR_ prefixed columns.")
     if features_shared_base:
-        print(f"[CV] Shared (unprefixed) features added to both country models: "
-              f"{features_shared_base}")
+        print(f"[CV] Shared features: {features_shared_base}")
 
-    # Validate Markov columns
     for pref in ['DE', 'FR']:
         if use_markov.get(pref, False):
             for i in range(k_regimes):
                 col = f"{pref}_regime_prob_{i}"
                 if col not in df.columns:
-                    raise ValueError(
-                        f"use_markov['{pref}']=True but '{col}' not found. "
-                        f"Call add_regime_probs_to_panel() first."
-                    )
+                    raise ValueError(f"Call add_regime_probs_to_panel() first.")
 
-    # ------------------------------------------------------------------ helpers
-    def safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
+    def safe_spearman(x, y):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
                 mask = np.isfinite(x) & np.isfinite(y)
-                if mask.sum() < 5:
-                    return 0.0
+                if mask.sum() < 5: return 0.0
                 xs, ys = x[mask], y[mask]
-                if np.std(xs) < 1e-12 or np.std(ys) < 1e-12:
-                    return 0.0
+                if np.std(xs) < 1e-12 or np.std(ys) < 1e-12: return 0.0
                 r = spearmanr(xs, ys).correlation
                 return 0.0 if not np.isfinite(r) else float(r)
             except Exception:
@@ -1164,37 +1214,22 @@ def two_regime_rolling_cv_per_country(
         w = np.exp(-decay * np.arange(n - 1, -1, -1, dtype=float))
         return w / w.mean()
 
-    # ----------------------------------------------------------------
-    # Optuna search — runs entirely within the training window.
-    # Returns best params dict merged with fixed params.
-    # ----------------------------------------------------------------
-    def _optuna_search(X_tr_full: pd.DataFrame, y_tr_full: pd.Series) -> dict:
-        """
-        Run Optuna on the inner val split of the training window.
-        The inner val is the last optuna_val_frac rows — same as train_xgb_safe.
-        Returns a full xgb_params dict with the best found hyperparameters.
-        """
+    def _optuna_search(X_tr_full, y_tr_full):
         valid = y_tr_full.notna() & np.isfinite(y_tr_full)
         X_c = X_tr_full.loc[valid]; y_c = y_tr_full.loc[valid].astype(float)
-
         val_size = max(int(optuna_val_frac * len(X_c)), 20)
         if len(X_c) <= val_size + 20:
-            return xgb_params   # too small — use defaults
-
-        X_t = X_c.iloc[:-val_size];  y_t = y_c.iloc[:-val_size]
-        X_v = X_c.iloc[-val_size:];  y_v = y_c.iloc[-val_size:]
-
+            return xgb_params
+        X_t, X_v = X_c.iloc[:-val_size], X_c.iloc[-val_size:]
+        y_t, y_v = y_c.iloc[:-val_size], y_c.iloc[-val_size:]
         dtrain_o = xgb.DMatrix(X_t, label=y_t, missing=np.nan)
         dval_o   = xgb.DMatrix(X_v, label=y_v, missing=np.nan)
         y_v_arr  = y_v.values
 
         def objective(trial):
             params = {
-                'objective':        'reg:squarederror',
-                'eval_metric':      'rmse',
-                'seed':             SEED,
-                'nthread':          1,
-                'verbosity':        0,
+                'objective': 'reg:squarederror', 'eval_metric': 'rmse',
+                'seed': SEED, 'nthread': 1, 'verbosity': 0,
                 'max_depth':        trial.suggest_int('max_depth', 2, 5),
                 'eta':              trial.suggest_float('eta', 0.005, 0.05, log=True),
                 'subsample':        trial.suggest_float('subsample', 0.4, 0.9),
@@ -1204,90 +1239,50 @@ def two_regime_rolling_cv_per_country(
                 'min_child_weight': trial.suggest_int('min_child_weight', 10, 60),
             }
             try:
-                bst = xgb.train(
-                    params, dtrain_o,
-                    num_boost_round=1500,
-                    evals=[(dval_o, 'val')],
-                    early_stopping_rounds=40,
-                    verbose_eval=False,
-                )
+                bst = xgb.train(params, dtrain_o, num_boost_round=1500,
+                                evals=[(dval_o, 'val')], early_stopping_rounds=40,
+                                verbose_eval=False)
                 preds_v = bst.predict(dval_o)
                 ic = safe_spearman(preds_v, y_v_arr)
-                return -ic if np.isfinite(ic) else 0.0   # minimise negative IC
+                return -ic if np.isfinite(ic) else 0.0
             except Exception:
                 return 0.0
 
         optuna.logging.set_verbosity(optuna.logging.ERROR)
         logging.getLogger("optuna").setLevel(logging.ERROR)
-                
-        study = optuna.create_study(
-            direction='minimize',
-            sampler=optuna.samplers.TPESampler(seed=SEED),
-        )
+        study = optuna.create_study(direction='minimize',
+                                    sampler=optuna.samplers.TPESampler(seed=SEED))
         study.optimize(objective, n_trials=n_optuna_trials, show_progress_bar=False)
-
         best = study.best_params
-        return {
-            'objective':        'reg:squarederror',
-            'eval_metric':      'rmse',
-            'seed':             SEED,
-            'nthread':          1,
-            'verbosity':        0,
-            'max_depth':        best['max_depth'],
-            'eta':              best['eta'],
-            'subsample':        best['subsample'],
-            'colsample_bytree': best['colsample_bytree'],
-            'lambda':           best['lambda'],
-            'alpha':            best['alpha'],
-            'min_child_weight': best['min_child_weight'],
-        }
+        return {'objective': 'reg:squarederror', 'eval_metric': 'rmse',
+                'seed': SEED, 'nthread': 1, 'verbosity': 0, **best}
 
-    # ----------------------------------------------------------------
-    # Core XGBoost training — uses either xgb_params or optuna result
-    # ----------------------------------------------------------------
-    def train_xgb_safe(
-        X: pd.DataFrame,
-        y: pd.Series,
-        sample_weight: Optional[np.ndarray] = None,
-        params_override: Optional[dict] = None,
-    ):
+    def train_xgb_safe(X, y, sample_weight=None, params_override=None):
         if X.shape[0] == 0: return None
         y_ser = pd.Series(y.values, index=X.index)
         valid = y_ser.notna() & np.isfinite(y_ser)
         if valid.sum() < min_samples_per_regime: return None
-
         X_c = X.loc[valid]; y_c = y_ser.loc[valid].astype(float)
         w_c = sample_weight[valid.values] if sample_weight is not None else None
-
         val_size = max(int(0.15 * len(X_c)), 20)
         if len(X_c) <= val_size + 10: return None
-
         X_tr, X_val = X_c.iloc[:-val_size], X_c.iloc[-val_size:]
         y_tr, y_val = y_c.iloc[:-val_size], y_c.iloc[-val_size:]
         w_tr = w_c[:-val_size] if w_c is not None else None
-
         p = params_override if params_override is not None else xgb_params
-
         dtrain = xgb.DMatrix(X_tr, label=y_tr, missing=np.nan, weight=w_tr)
         dval   = xgb.DMatrix(X_val, label=y_val, missing=np.nan)
         try:
-            m = xgb.train(
-                p, dtrain, num_boost_round=2000,
-                evals=[(dval, 'val')], early_stopping_rounds=50,
-                verbose_eval=False,
-            )
-            return {
-                'model':      m,
-                'train_pred': m.predict(dtrain),
-                'val_pred':   m.predict(dval),
-                'y_tr':       y_tr.values,
-                'y_val':      y_val.values,
-            }
+            m = xgb.train(p, dtrain, num_boost_round=2000,
+                          evals=[(dval, 'val')], early_stopping_rounds=50,
+                          verbose_eval=False)
+            return {'model': m, 'train_pred': m.predict(dtrain),
+                    'val_pred': m.predict(dval),
+                    'y_tr': y_tr.values, 'y_val': y_val.values}
         except Exception:
             return None
 
-    # ------------------------------------------------------------------ fold
-    def run_fold(i: int):
+    def run_fold(i):
         train_start = max(0, i - train_window) if train_window is not None else 0
         train_dates = unique_dates[train_start:i]
         test_dates  = unique_dates[i + gap_days: i + gap_days + test_horizon]
@@ -1297,33 +1292,45 @@ def two_regime_rolling_cv_per_country(
         train_mask = df['DATE'].isin(train_dates)
         test_mask  = df['DATE'].isin(test_dates)
 
-        # Start from base + shared for each country
         features_de = features_de_base + features_shared_base
         features_fr = features_fr_base + features_shared_base
         fold_df = df.copy()
 
-        # ---- Markov (pre-computed filtered probs) ----
+        # ---- Regime flag for this fold (from training window only) ----
+        # Per-country: flag = 1 if most recent training zscore > threshold
+        fold_regime = {}
+        if use_regime_targets:
+            for pref in ['DE', 'FR']:
+                rv_col = f'{pref}_realized_vol'
+                if rv_col not in fold_df.columns:
+                    fold_regime[pref] = 1  # default to high-vol
+                    continue
+                rv_tr = fold_df.loc[train_mask, rv_col].astype(float).clip(lower=1e-12)
+                log_rv = np.log(rv_tr)
+                mu  = log_rv.rolling(vol_regime_window, min_periods=30).mean()
+                sig = log_rv.rolling(vol_regime_window, min_periods=30).std().clip(lower=1e-8)
+                zs  = (log_rv - mu) / sig
+                # Use last training-window zscore to determine test period regime
+                last_zs = zs.dropna().iloc[-1] if zs.dropna().size else 0.0
+                fold_regime[pref] = int(last_zs > vol_regime_threshold)
+
+        # ---- Markov ----
         for pref, feats in [('DE', features_de), ('FR', features_fr)]:
-            if not use_markov.get(pref, False):
-                continue
+            if not use_markov.get(pref, False): continue
             last_train_iloc = fold_df.loc[train_mask].index[-1]
             for i_state in range(k_regimes):
                 col = f"{pref}_regime_prob_{i_state}"
                 last_val = fold_df.loc[last_train_iloc, col]
                 fill_val = float(last_val) if np.isfinite(last_val) else 0.5
                 fold_df.loc[test_mask, col] = fill_val
-                if col not in feats:
-                    feats.append(col)
+                if col not in feats: feats.append(col)
 
-        # ---- Vol zscore (per-fold, training window only) ----
+        # ---- Vol zscore ----
         for pref, feats in [('DE', features_de), ('FR', features_fr)]:
-            if not use_vol_zscore.get(pref, False):
-                continue
-            rv_col = f"{pref}_realized_vol"
-            zs_col = f"{pref}_vol_zscore"
-            if rv_col not in fold_df.columns:
-                continue
-            rv_tr     = fold_df.loc[train_mask, rv_col].astype(float).clip(lower=1e-12)
+            if not use_vol_zscore.get(pref, False): continue
+            rv_col = f"{pref}_realized_vol"; zs_col = f"{pref}_vol_zscore"
+            if rv_col not in fold_df.columns: continue
+            rv_tr = fold_df.loc[train_mask, rv_col].astype(float).clip(lower=1e-12)
             log_rv_tr = np.log(rv_tr)
             mu  = log_rv_tr.rolling(vol_zscore_window, min_periods=30).mean()
             sig = log_rv_tr.rolling(vol_zscore_window, min_periods=30).std().clip(lower=1e-8)
@@ -1332,60 +1339,58 @@ def two_regime_rolling_cv_per_country(
             fold_df.loc[train_mask, zs_col] = ((log_rv_tr - mu) / sig).values
             rv_te = fold_df.loc[test_mask, rv_col].astype(float).clip(lower=1e-12)
             fold_df.loc[test_mask, zs_col] = (np.log(rv_te) - last_mu) / last_sig
-            if zs_col not in feats:
-                feats.append(zs_col)
+            if zs_col not in feats: feats.append(zs_col)
 
-        # ---- X / y ----
+        # ---- Select targets based on regime ----
+        def _get_target(pref, default_target, calm_target):
+            if not use_regime_targets:
+                return default_target
+            regime = fold_regime.get(pref, 1)
+            if regime == 1:
+                return default_target   # high-vol: predict HAR residual
+            else:
+                return calm_target      # calm: predict log(rv) level
+
+        tgt_de = _get_target('DE', target_de, calm_target_de)
+        tgt_fr = _get_target('FR', target_fr, calm_target_fr)
+
+        # Use default target if calm target not available
+        if tgt_de not in fold_df.columns: tgt_de = target_de
+        if tgt_fr not in fold_df.columns: tgt_fr = target_fr
+
         def _Xy(feats, tgt, mask):
             X = fold_df.loc[mask, feats].copy()
             y = (fold_df.loc[mask, tgt].copy() if tgt in fold_df.columns
                  else pd.Series(np.nan, index=X.index))
             return X, y
 
-        X_tr_de, y_tr_de = _Xy(features_de, target_de, train_mask)
-        X_te_de, y_te_de = _Xy(features_de, target_de, test_mask)
-        X_tr_fr, y_tr_fr = _Xy(features_fr, target_fr, train_mask)
-        X_te_fr, y_te_fr = _Xy(features_fr, target_fr, test_mask)
+        X_tr_de, y_tr_de = _Xy(features_de, tgt_de, train_mask)
+        X_te_de, y_te_de = _Xy(features_de, tgt_de, test_mask)
+        X_tr_fr, y_tr_fr = _Xy(features_fr, tgt_fr, train_mask)
+        X_te_fr, y_te_fr = _Xy(features_fr, tgt_fr, test_mask)
 
-        # ---- Per-fold Optuna (optional) ----
-        # Runs on the training window only. One study per country per fold.
-        # Best params used for the final model fit below.
-        params_de = xgb_params
-        params_fr = xgb_params
+        params_de = xgb_params; params_fr = xgb_params
         if use_optuna:
             params_de = _optuna_search(X_tr_de, y_tr_de)
             params_fr = _optuna_search(X_tr_fr, y_tr_fr)
 
-        # ---- Train + predict ----
         def _train_predict(X_tr, y_tr, X_te, pref, params):
             n = len(X_tr)
             w_base = _recency_weights(n, recency_halflife) if use_recency_weights else None
-
             prob_col_high = f"{pref}_regime_prob_1"
-            has_regime = (
-                use_per_regime_models
-                and use_markov.get(pref, False)
-                and prob_col_high in fold_df.columns
-            )
-
+            has_regime = (use_per_regime_models and use_markov.get(pref, False)
+                          and prob_col_high in fold_df.columns)
             if not has_regime:
-                res = train_xgb_safe(X_tr, y_tr, sample_weight=w_base,
-                                     params_override=params)
-                if res is None:
-                    return np.full(len(X_te), np.nan), res
+                res = train_xgb_safe(X_tr, y_tr, sample_weight=w_base, params_override=params)
+                if res is None: return np.full(len(X_te), np.nan), res
                 return res['model'].predict(xgb.DMatrix(X_te, missing=np.nan)), res
-
             p_high = fold_df.loc[train_mask, prob_col_high].fillna(0.5).values[:n]
             p_low  = 1.0 - p_high
             base   = w_base if w_base is not None else np.ones(n)
-            w_high = base * p_high;  w_high /= (w_high.mean() + 1e-12)
-            w_low  = base * p_low;   w_low  /= (w_low.mean()  + 1e-12)
-
-            res_high = train_xgb_safe(X_tr, y_tr, sample_weight=w_high,
-                                      params_override=params)
-            res_low  = train_xgb_safe(X_tr, y_tr, sample_weight=w_low,
-                                      params_override=params)
-
+            w_high = base * p_high; w_high /= (w_high.mean() + 1e-12)
+            w_low  = base * p_low;  w_low  /= (w_low.mean()  + 1e-12)
+            res_high = train_xgb_safe(X_tr, y_tr, sample_weight=w_high, params_override=params)
+            res_low  = train_xgb_safe(X_tr, y_tr, sample_weight=w_low,  params_override=params)
             p_high_test = fold_df.loc[test_mask, prob_col_high].fillna(0.5).values
             dtest = xgb.DMatrix(X_te, missing=np.nan)
             ph = res_high['model'].predict(dtest) if res_high else np.zeros(len(X_te))
@@ -1395,42 +1400,34 @@ def two_regime_rolling_cv_per_country(
         preds_de, res_de = _train_predict(X_tr_de, y_tr_de, X_te_de, 'DE', params_de)
         preds_fr, res_fr = _train_predict(X_tr_fr, y_tr_fr, X_te_fr, 'FR', params_fr)
 
-        # ---- Diagnostics ----
         def _diag(res):
             if res is None:
                 return {'train_rmse_exp': np.nan, 'val_rmse_exp': np.nan,
                         'train_ic_exp': np.nan, 'val_ic_exp': np.nan, 'fi_exp': {}}
             tp, vp, ty, vy = res['train_pred'], res['val_pred'], res['y_tr'], res['y_val']
-            return {
-                'train_rmse_exp': float(np.sqrt(np.mean((tp-ty)**2))) if tp.size else np.nan,
-                'val_rmse_exp':   float(np.sqrt(np.mean((vp-vy)**2))) if vp.size else np.nan,
-                'train_ic_exp':   safe_spearman(tp, ty),
-                'val_ic_exp':     safe_spearman(vp, vy),
-                'fi_exp':         res['model'].get_score(importance_type='gain'),
-            }
+            return {'train_rmse_exp': float(np.sqrt(np.mean((tp-ty)**2))) if tp.size else np.nan,
+                    'val_rmse_exp':   float(np.sqrt(np.mean((vp-vy)**2))) if vp.size else np.nan,
+                    'train_ic_exp':   safe_spearman(tp, ty),
+                    'val_ic_exp':     safe_spearman(vp, vy),
+                    'fi_exp':         res['model'].get_score(importance_type='gain')}
 
-        diag_de = _diag(res_de)
-        diag_fr = _diag(res_fr)
+        diag_de = _diag(res_de); diag_fr = _diag(res_fr)
 
-        # ---- Prediction rows ----
         rows = []
         for j, idx in enumerate(X_te_de.index):
-            rows.append({
-                'DATE':    fold_df.loc[idx, 'DATE'],
-                'COUNTRY': 'DE',
-                'pred':    float(preds_de[j]) if np.isfinite(preds_de[j]) else np.nan,
-                'true':    float(y_te_de.loc[idx]) if np.isfinite(y_te_de.loc[idx]) else np.nan,
-            })
+            rows.append({'DATE': fold_df.loc[idx, 'DATE'], 'COUNTRY': 'DE',
+                         'pred': float(preds_de[j]) if np.isfinite(preds_de[j]) else np.nan,
+                         'true': float(y_te_de.loc[idx]) if np.isfinite(y_te_de.loc[idx]) else np.nan,
+                         'fold_regime_de': fold_regime.get('DE', 1),
+                         'target_used_de': tgt_de})
         for j, idx in enumerate(X_te_fr.index):
-            rows.append({
-                'DATE':    fold_df.loc[idx, 'DATE'],
-                'COUNTRY': 'FR',
-                'pred':    float(preds_fr[j]) if np.isfinite(preds_fr[j]) else np.nan,
-                'true':    float(y_te_fr.loc[idx]) if np.isfinite(y_te_fr.loc[idx]) else np.nan,
-            })
+            rows.append({'DATE': fold_df.loc[idx, 'DATE'], 'COUNTRY': 'FR',
+                         'pred': float(preds_fr[j]) if np.isfinite(preds_fr[j]) else np.nan,
+                         'true': float(y_te_fr.loc[idx]) if np.isfinite(y_te_fr.loc[idx]) else np.nan,
+                         'fold_regime_fr': fold_regime.get('FR', 1),
+                         'target_used_fr': tgt_fr})
         pred_df = pd.DataFrame(rows)
 
-        # ---- Per-fold metrics ----
         def safe_metrics(p, t):
             p, t = np.asarray(p, float), np.asarray(t, float)
             m = np.isfinite(p) & np.isfinite(t)
@@ -1446,11 +1443,9 @@ def two_regime_rolling_cv_per_country(
                 if len(sub):
                     iv, rv2, mv = safe_metrics(sub['pred'], sub['true'])
                     if is_de:
-                        ic_de=iv; rmse_de=rv2; mae_de=mv
-                        n_test_de=int(sub['true'].notna().sum())
+                        ic_de=iv; rmse_de=rv2; mae_de=mv; n_test_de=int(sub['true'].notna().sum())
                     else:
-                        ic_fr=iv; rmse_fr=rv2; mae_fr=mv
-                        n_test_fr=int(sub['true'].notna().sum())
+                        ic_fr=iv; rmse_fr=rv2; mae_fr=mv; n_test_fr=int(sub['true'].notna().sum())
 
         pm = pred_df['pred'].notna() & pred_df['true'].notna()
         pooled_ic   = safe_spearman(pred_df.loc[pm,'pred'], pred_df.loc[pm,'true'])
@@ -1458,28 +1453,23 @@ def two_regime_rolling_cv_per_country(
         pooled_mae  = float(np.mean(np.abs(pred_df.loc[pm,'pred']-pred_df.loc[pm,'true']))) if pm.any() else np.nan
 
         fold_stat = {
-            'train_until':           train_dates[-1],
-            'test_from':             test_dates[0],
-            'test_to':               test_dates[-1],
-            'n_train':               int(train_mask.sum()),
-            'n_test_de':             n_test_de,
-            'n_test_fr':             n_test_fr,
-            'spearman_ic_de':        float(ic_de)   if np.isfinite(ic_de)   else np.nan,
-            'rmse_de':               float(rmse_de) if np.isfinite(rmse_de) else np.nan,
-            'mae_de':                float(mae_de)  if np.isfinite(mae_de)  else np.nan,
-            'spearman_ic_fr':        float(ic_fr)   if np.isfinite(ic_fr)   else np.nan,
-            'rmse_fr':               float(rmse_fr) if np.isfinite(rmse_fr) else np.nan,
-            'mae_fr':                float(mae_fr)  if np.isfinite(mae_fr)  else np.nan,
-            'pooled_ic':             pooled_ic,
-            'pooled_rmse':           pooled_rmse,
-            'pooled_mae':            pooled_mae,
+            'train_until': train_dates[-1], 'test_from': test_dates[0],
+            'test_to': test_dates[-1], 'n_train': int(train_mask.sum()),
+            'n_test_de': n_test_de, 'n_test_fr': n_test_fr,
+            'spearman_ic_de': float(ic_de) if np.isfinite(ic_de) else np.nan,
+            'rmse_de': float(rmse_de) if np.isfinite(rmse_de) else np.nan,
+            'mae_de':  float(mae_de)  if np.isfinite(mae_de)  else np.nan,
+            'spearman_ic_fr': float(ic_fr) if np.isfinite(ic_fr) else np.nan,
+            'rmse_fr': float(rmse_fr) if np.isfinite(rmse_fr) else np.nan,
+            'mae_fr':  float(mae_fr)  if np.isfinite(mae_fr)  else np.nan,
+            'pooled_ic': pooled_ic, 'pooled_rmse': pooled_rmse, 'pooled_mae': pooled_mae,
             'train_rmse_pre_exp':    float(diag_de.get('train_rmse_exp', np.nan)),
             'val_rmse_pre_exp':      float(diag_de.get('val_rmse_exp',   np.nan)),
             'train_ic_pre_exp':      float(diag_de.get('train_ic_exp',   np.nan)),
             'val_ic_pre_exp':        float(diag_de.get('val_ic_exp',     np.nan)),
             'train_rmse_post_exp':   np.nan, 'val_rmse_post_exp': np.nan,
             'train_ic_post_exp':     np.nan, 'val_ic_post_exp':   np.nan,
-            'n_pre_train':           np.nan, 'n_post_train':      np.nan,
+            'n_pre_train': np.nan, 'n_post_train': np.nan,
             'train_rmse_pre_exp_de': float(diag_de.get('train_rmse_exp', np.nan)),
             'val_rmse_pre_exp_de':   float(diag_de.get('val_rmse_exp',   np.nan)),
             'train_ic_pre_exp_de':   float(diag_de.get('train_ic_exp',   np.nan)),
@@ -1488,37 +1478,32 @@ def two_regime_rolling_cv_per_country(
             'val_rmse_pre_exp_fr':   float(diag_fr.get('val_rmse_exp',   np.nan)),
             'train_ic_pre_exp_fr':   float(diag_fr.get('train_ic_exp',   np.nan)),
             'val_ic_pre_exp_fr':     float(diag_fr.get('val_ic_exp',     np.nan)),
-            'markov_de':             {'fitted': use_markov.get('DE', False), 'source': 'pre_computed'},
-            'markov_fr':             {'fitted': use_markov.get('FR', False), 'source': 'pre_computed'},
-            'fi_exp_de':             diag_de.get('fi_exp', {}),
-            'fi_exp_fr':             diag_fr.get('fi_exp', {}),
-            'train_window_used':     len(train_dates),
-            # Optuna best params stored for inspection
-            'optuna_params_de':      params_de if use_optuna else {},
-            'optuna_params_fr':      params_fr if use_optuna else {},
+            'markov_de': {'fitted': use_markov.get('DE', False), 'source': 'pre_computed'},
+            'markov_fr': {'fitted': use_markov.get('FR', False), 'source': 'pre_computed'},
+            'fi_exp_de': diag_de.get('fi_exp', {}), 'fi_exp_fr': diag_fr.get('fi_exp', {}),
+            'train_window_used': len(train_dates),
+            'fold_regime_de': fold_regime.get('DE', 1),
+            'fold_regime_fr': fold_regime.get('FR', 1),
+            'target_used_de': tgt_de, 'target_used_fr': tgt_fr,
+            'optuna_params_de': params_de if use_optuna else {},
+            'optuna_params_fr': params_fr if use_optuna else {},
         }
 
         gc.collect()
         return pred_df, fold_stat
 
-    # ------------------------------------------------------------------ run
-    starts = list(range(
-        min_train_days,
-        len(unique_dates) - gap_days - test_horizon + 1,
-        test_horizon,
-    ))
+    starts = list(range(min_train_days,
+                        len(unique_dates) - gap_days - test_horizon + 1,
+                        test_horizon))
     with parallel_backend("loky"):
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(run_fold)(i) for i in starts
-        )
+        results = Parallel(n_jobs=n_jobs, verbose=0)(
+            delayed(run_fold)(i) for i in starts)
     results = [r for r in results if r is not None]
-    if not results:
-        raise ValueError("No folds produced.")
+    if not results: raise ValueError("No folds produced.")
 
     all_preds  = pd.concat([r[0] for r in results], ignore_index=True)
     fold_stats = pd.DataFrame([r[1] for r in results])
 
-    # ------------------------------------------------------------------ aggregate
     pm_all = all_preds['pred'].notna() & all_preds['true'].notna()
     pooled_ic   = safe_spearman(all_preds.loc[pm_all,'pred'], all_preds.loc[pm_all,'true'])
     pooled_rmse = float(np.sqrt(np.mean((all_preds.loc[pm_all,'pred']-all_preds.loc[pm_all,'true'])**2))) if pm_all.any() else np.nan
@@ -1535,8 +1520,7 @@ def two_regime_rolling_cv_per_country(
         else:
             per_country_ic[c]=per_country_rmse[c]=per_country_mae[c]=np.nan
 
-    rolling_ic={}; rolling_rmse={}; rolling_mae={}
-    rolling_pred_mean={}; rolling_pred_std={}
+    rolling_ic={}; rolling_rmse={}; rolling_mae={}; rolling_pred_mean={}; rolling_pred_std={}
     for c in ['DE','FR']:
         sub = all_preds[all_preds['COUNTRY']==c].set_index('DATE').sort_index()
         if not len(sub):
@@ -1559,44 +1543,40 @@ def two_regime_rolling_cv_per_country(
         'mean_fold_ic_de':     float(fold_stats['spearman_ic_de'].dropna().mean()),
         'mean_fold_ic_fr':     float(fold_stats['spearman_ic_fr'].dropna().mean()),
         'mean_fold_pooled_ic': float(fold_stats['pooled_ic'].dropna().mean()),
-        'pooled_ic':           pooled_ic,
-        'pooled_rmse':         pooled_rmse,
-        'pooled_mae':          pooled_mae,
-        'per_country_ic':      per_country_ic,
-        'per_country_rmse':    per_country_rmse,
-        'per_country_mae':     per_country_mae,
-        'mean_rmse_fold':      float(fold_stats[['rmse_de','rmse_fr']].stack().dropna().mean()),
-        'mean_mae_fold':       float(fold_stats[['mae_de','mae_fr']].stack().dropna().mean()),
-        'n_folds':             len(fold_stats),
-        'n_regime_detected_folds_de': int(
-            fold_stats['markov_de'].apply(
-                lambda x: bool(x.get('fitted')) if isinstance(x,dict) else False).sum()),
-        'n_regime_detected_folds_fr': int(
-            fold_stats['markov_fr'].apply(
-                lambda x: bool(x.get('fitted')) if isinstance(x,dict) else False).sum()),
+        'pooled_ic': pooled_ic, 'pooled_rmse': pooled_rmse, 'pooled_mae': pooled_mae,
+        'per_country_ic': per_country_ic, 'per_country_rmse': per_country_rmse,
+        'per_country_mae': per_country_mae,
+        'mean_rmse_fold': float(fold_stats[['rmse_de','rmse_fr']].stack().dropna().mean()),
+        'mean_mae_fold':  float(fold_stats[['mae_de','mae_fr']].stack().dropna().mean()),
+        'n_folds': len(fold_stats),
+        'n_regime_detected_folds_de': int(fold_stats['markov_de'].apply(
+            lambda x: bool(x.get('fitted')) if isinstance(x,dict) else False).sum()),
+        'n_regime_detected_folds_fr': int(fold_stats['markov_fr'].apply(
+            lambda x: bool(x.get('fitted')) if isinstance(x,dict) else False).sum()),
     }
 
-    print("=== SUMMARY ===")
+    if use_regime_targets:
+        n_hv_de = int(fold_stats['fold_regime_de'].sum())
+        n_hv_fr = int(fold_stats['fold_regime_fr'].sum())
+        n_tot   = len(fold_stats)
+        print(f"Regime-conditional targets: "
+              f"DE high-vol folds={n_hv_de}/{n_tot}, "
+              f"FR high-vol folds={n_hv_fr}/{n_tot}")
+
+    print(f"=== SUMMARY ===")
     print(f"Pooled IC: {pooled_ic:.4f}")
     print(f"Per-country IC: {per_country_ic}")
     print(f"Mean fold ICs — DE: {overall['mean_fold_ic_de']:.4f}  FR: {overall['mean_fold_ic_fr']:.4f}")
-    print(f"Mean RMSE (fold mean): {overall['mean_rmse_fold']:.4f}")
-    print(f"Pooled RMSE / MAE: {pooled_rmse:.4f} / {pooled_mae:.4f}")
-    if use_optuna:
-        print(f"Optuna: {n_optuna_trials} trials per fold per country")
 
     return all_preds, {
-        'folds':             fold_stats,
-        'overall':           overall,
-        'rolling_ic':        rolling_ic,
-        'rolling_pooled_ic': rolling_pooled_ic,
-        'rolling_rmse':      rolling_rmse,
-        'rolling_mae':       rolling_mae,
-        'rolling_pred_mean': rolling_pred_mean,
-        'rolling_pred_std':  rolling_pred_std,
-        'pooled_pred_mean':  pooled_pred_mean,
-        'pooled_pred_std':   pooled_pred_std,
+        'folds': fold_stats, 'overall': overall,
+        'rolling_ic': rolling_ic, 'rolling_pooled_ic': rolling_pooled_ic,
+        'rolling_rmse': rolling_rmse, 'rolling_mae': rolling_mae,
+        'rolling_pred_mean': rolling_pred_mean, 'rolling_pred_std': rolling_pred_std,
+        'pooled_pred_mean': pooled_pred_mean, 'pooled_pred_std': pooled_pred_std,
     }
+
+
 
     
 #----------------------------------------------------------

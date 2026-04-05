@@ -205,8 +205,13 @@ def make_t_plus_1_targets_winsorized(
     df["DE_residual_target"] = de_resid.shift(-1)
     df["FR_residual_target"] = fr_resid.shift(-1)
 
+    df['DE_log_rv_target'] = np.log(
+        df['DE_realized_vol'].shift(-1).clip(lower=1e-12))
+    df['FR_log_rv_target'] = np.log(
+        df['FR_realized_vol'].shift(-1).clip(lower=1e-12))
+
     if verbose:
-        for col in ["DE_residual_target", "FR_residual_target"]:
+        for col in ["DE_residual_target", "FR_residual_target", 'DE_log_rv_target', 'FR_log_rv_target']:
             s = df[col].dropna()
             print(
                 f"[target stats] {col}: n={len(s)}  "
